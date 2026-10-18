@@ -1,0 +1,371 @@
+From b24cd924065d7f62fbd1617ead26d60c7f1eac91 Mon Sep 17 00:00:00 2001
+From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
+Date: Sun, 18 Oct 2026 13:04:04 +0300
+Subject: [PATCH 3/4] mac80211: ath12k: low-memory support for 256 MiB IPQ5332
+ boards
+
+- 950: 256 MiB firmware memory mode (QSDK tgt-mem-mode 2), selectable
+  from the AHB device tree, with a host profile sized for ~170 MiB of
+  Linux RAM (smaller RX refill ring, TX pools, link descriptor pool);
+- 951: rx_mon_status parameter; the per-PPDU RX monitor status ring is
+  off by default in that mode (costs a CPU worth of IRQs, only feeds AP
+  station signal / RX rate);
+- 952: host TX flow control (stop mac80211 queues at 3072 frames in
+  flight) so a busy radio cannot pin tens of MiB of skbs.
+---
+ .../950-wifi-ath12k-256M-memory-profile.patch | 151 ++++++++++++++++++
+ ...h12k-optional-RX-monitor-status-ring.patch |  49 ++++++
+ ...952-wifi-ath12k-host-TX-flow-control.patch | 127 +++++++++++++++
+ 3 files changed, 327 insertions(+)
+ create mode 100644 package/kernel/mac80211/patches/ath12k/950-wifi-ath12k-256M-memory-profile.patch
+ create mode 100644 package/kernel/mac80211/patches/ath12k/951-wifi-ath12k-optional-RX-monitor-status-ring.patch
+ create mode 100644 package/kernel/mac80211/patches/ath12k/952-wifi-ath12k-host-TX-flow-control.patch
+
+diff --git a/package/kernel/mac80211/patches/ath12k/950-wifi-ath12k-256M-memory-profile.patch b/package/kernel/mac80211/patches/ath12k/950-wifi-ath12k-256M-memory-profile.patch
+new file mode 100644
+index 0000000000..933421c2bc
+--- /dev/null
++++ b/package/kernel/mac80211/patches/ath12k/950-wifi-ath12k-256M-memory-profile.patch
+@@ -0,0 +1,151 @@
++From: OpenWrt Xiaomi RD16 port
++Subject: [PATCH] wifi: ath12k: 256 MiB memory profile for AHB (IPQ5332 + QCN6432)
++
++QSDK boards with 256 MiB RAM (Xiaomi BE3600 RD16) run the Q6 WLAN firmware
++in memory mode 2 ("qcom,tgt-mem-mode = <2>" in the stock DT); Linux only
++sees ~170 MiB of it. Add ATH12K_QMI_MEMORY_MODE_LOW_256_M and let AHB
++devices pick it from "qcom,ath12k-fw-memory-mode", with a host profile
++sized for that board:
++
++ - 9 vdevs, 64/32/32 clients (stock cnss limits)
++ - RX refill ring 1024 entries (each one pins an RX skb from probe on)
++ - 4096 TX descriptors per pool and completion entries
++ - WBM idle link descriptor pool halved (2 MiB instead of 4 MiB)
++ - monitor rings 256/512
++
++---
++--- a/drivers/net/wireless/ath/ath12k/core.c
+++++ b/drivers/net/wireless/ath/ath12k/core.c
++@@ -53,6 +53,7 @@
++ 			.rxdma_monitor_dst_ring_size = 8092,
++ 			.num_pool_tx_desc = 32768,
++ 			.rx_desc_count = 12288,
+++			.rxdma_buf_ring_size = 4096,
++ 		},
++ 	},
++ [ATH12K_QMI_MEMORY_MODE_LOW_512_M] = {
++@@ -66,6 +67,29 @@
++ 			.rxdma_monitor_dst_ring_size = 512,
++ 			.num_pool_tx_desc = 16384,
++ 			.rx_desc_count = 6144,
+++			.rxdma_buf_ring_size = 4096,
+++		},
+++	},
+++/* QSDK tgt-mem-mode 2: firmware built for 256 MiB boards (e.g. Xiaomi
+++ * BE3600 RD16, whose stock cnss config caps num_vdevs at 9 and num_peers
+++ * at 128). Host rings and RX buffers sized for ~160 MiB of Linux RAM.
+++ */
+++[ATH12K_QMI_MEMORY_MODE_LOW_256_M] = {
+++		.num_vdevs = 9,
+++		.max_client_single = 64,
+++		.max_client_dbs = 32,
+++		.max_client_dbs_sbs = 32,
+++		.dp_params = {
+++			/* TX pools are per access category; tx_pending_max (below)
+++			 * caps the frames in flight, so 4096 per pool is enough
+++			 */
+++			.tx_comp_ring_size = 4096,
+++			.rxdma_monitor_buf_ring_size = 256,
+++			.rxdma_monitor_dst_ring_size = 512,
+++			.num_pool_tx_desc = 4096,
+++			.rx_desc_count = 4096,
+++			/* every entry pins an RX skb from probe on */
+++			.rxdma_buf_ring_size = 1024,
++ 		},
++ 	},
++ };
++@@ -1827,7 +1851,7 @@
++ 
++ 	if (!of_property_read_u32(ab->dev->of_node,
++ 				  "qcom,ath12k-fw-memory-mode", &mode)) {
++-		if (mode <= ATH12K_QMI_MEMORY_MODE_LOW_512_M) {
+++		if (mode <= ATH12K_QMI_MEMORY_MODE_LOW_256_M) {
++ 			ath12k_info(ab, "firmware memory mode %u from device tree\n",
++ 				    mode);
++ 			return (enum ath12k_qmi_mem_mode)mode;
++--- a/drivers/net/wireless/ath/ath12k/core.h
+++++ b/drivers/net/wireless/ath/ath12k/core.h
++@@ -942,6 +942,7 @@
++ 	u32 rxdma_monitor_dst_ring_size;
++ 	u32 num_pool_tx_desc;
++ 	u32 rx_desc_count;
+++	u32 rxdma_buf_ring_size;
++ };
++ 
++ struct ath12k_mem_profile_based_param {
++--- a/drivers/net/wireless/ath/ath12k/dp.c
+++++ b/drivers/net/wireless/ath/ath12k/dp.c
++@@ -742,6 +742,13 @@
++ 	if (*n_link_desc & (*n_link_desc - 1))
++ 		*n_link_desc = 1 << fls(*n_link_desc);
++ 
+++	/* 256 MiB boards: the pool is sized for 64 clients x 2 TIDs (32768
+++	 * x 128 B = 4 MiB of coherent memory per radio); half is plenty for
+++	 * the 32-64 clients this profile allows.
+++	 */
+++	if (ab->target_mem_mode == ATH12K_QMI_MEMORY_MODE_LOW_256_M)
+++		*n_link_desc >>= 1;
+++
++ 	ret = ath12k_dp_srng_setup(ab, &dp->wbm_idle_ring,
++ 				   HAL_WBM_IDLE_LINK, 0, 0, *n_link_desc);
++ 	if (ret) {
++--- a/drivers/net/wireless/ath/ath12k/dp.h
+++++ b/drivers/net/wireless/ath/ath12k/dp.h
++@@ -204,7 +204,8 @@
++ #define DP_REO_EXCEPTION_RING_SIZE	128
++ #define DP_REO_CMD_RING_SIZE		256
++ #define DP_REO_STATUS_RING_SIZE		2048
++-#define DP_RXDMA_BUF_RING_SIZE		4096
+++#define DP_RXDMA_BUF_RING_SIZE(ab) \
+++	((ab)->profile_param->dp_params.rxdma_buf_ring_size)
++ #define DP_RX_MAC_BUF_RING_SIZE		2048
++ #define DP_RXDMA_REFILL_RING_SIZE	2048
++ #define DP_RXDMA_ERR_DST_RING_SIZE	1024
++--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
+++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
++@@ -1703,7 +1703,7 @@
++ 	ret = ath12k_dp_srng_setup(ab,
++ 				   &dp->rx_refill_buf_ring.refill_buf_ring,
++ 				   HAL_RXDMA_BUF, 0, 0,
++-				   DP_RXDMA_BUF_RING_SIZE);
+++				   DP_RXDMA_BUF_RING_SIZE(ab));
++ 	if (ret) {
++ 		ath12k_warn(ab, "failed to setup rx_refill_buf_ring\n");
++ 		return ret;
++--- a/drivers/net/wireless/ath/ath12k/qmi.h
+++++ b/drivers/net/wireless/ath/ath12k/qmi.h
++@@ -624,6 +624,7 @@
++ enum ath12k_qmi_mem_mode {
++ 	ATH12K_QMI_MEMORY_MODE_DEFAULT = 0,
++ 	ATH12K_QMI_MEMORY_MODE_LOW_512_M,
+++	ATH12K_QMI_MEMORY_MODE_LOW_256_M,
++ };
++ 
++ static inline void ath12k_qmi_set_event_block(struct ath12k_qmi *qmi, bool block)
++--- a/drivers/net/wireless/ath/ath12k/wifi7/ahb.c
+++++ b/drivers/net/wireless/ath/ath12k/wifi7/ahb.c
++@@ -64,6 +64,24 @@
++ 	}
++ 
++ 	ab->target_mem_mode = ATH12K_QMI_MEMORY_MODE_DEFAULT;
+++	{
+++		u32 mode;
+++
+++		/* AHB radios have no RAM heuristic; let the board DT pick the
+++		 * firmware memory profile (QSDK "qcom,tgt-mem-mode").
+++		 */
+++		if (!of_property_read_u32(ab->dev->of_node,
+++					  "qcom,ath12k-fw-memory-mode", &mode)) {
+++			if (mode <= ATH12K_QMI_MEMORY_MODE_LOW_256_M) {
+++				ath12k_info(ab, "firmware memory mode %u from device tree\n",
+++					    mode);
+++				ab->target_mem_mode = mode;
+++			} else {
+++				ath12k_warn(ab, "ignoring unsupported firmware memory mode %u\n",
+++					    mode);
+++			}
+++		}
+++	}
++ 	ab->hw_rev = hw_rev;
++ 
++ 	ret = ath12k_wifi7_hw_init(ab);
+diff --git a/package/kernel/mac80211/patches/ath12k/951-wifi-ath12k-optional-RX-monitor-status-ring.patch b/package/kernel/mac80211/patches/ath12k/951-wifi-ath12k-optional-RX-monitor-status-ring.patch
+new file mode 100644
+index 0000000000..ea521ac3f4
+--- /dev/null
++++ b/package/kernel/mac80211/patches/ath12k/951-wifi-ath12k-optional-RX-monitor-status-ring.patch
+@@ -0,0 +1,49 @@
++From: OpenWrt Xiaomi RD16 port
++Subject: [PATCH] wifi: ath12k: make the default RX monitor status ring optional
++
++ath12k_mac_start() always arms the RX monitor status ring so that every
++received PPDU's status reaches the host, only to derive station signal and
++RX rate. On IPQ5332 + QCN6432 this is ~500k interrupts per radio under load.
++Add rx_mon_status (-1 auto = off in the 256 MiB memory mode, 0 off, 1 on).
++With it off, AP station dumps lose signal and RX bitrate; TX rate stays.
++
++---
++--- a/drivers/net/wireless/ath/ath12k/mac.c
+++++ b/drivers/net/wireless/ath/ath12k/mac.c
++@@ -233,6 +233,23 @@
++ 
++ };
++ 
+++/* Per-PPDU RX monitor status is what feeds the AP-side station signal and
+++ * RX rate; parsing it costs a large share of a CPU at high throughput.
+++ * -1: on, except in the 256 MiB firmware memory mode; 0: off; 1: on.
+++ */
+++static int ath12k_rx_mon_status = -1;
+++module_param_named(rx_mon_status, ath12k_rx_mon_status, int, 0444);
+++MODULE_PARM_DESC(rx_mon_status,
+++		 "RX monitor status ring for station signal/RX rate (-1 auto, 0 off, 1 on)");
+++
+++static bool ath12k_mac_rx_mon_status_wanted(struct ath12k *ar)
+++{
+++	if (ath12k_rx_mon_status >= 0)
+++		return ath12k_rx_mon_status;
+++
+++	return ar->ab->target_mem_mode != ATH12K_QMI_MEMORY_MODE_LOW_256_M;
+++}
+++
++ const struct htt_rx_ring_tlv_filter ath12k_mac_mon_status_filter_default = {
++ 	.rx_filter = HTT_RX_FILTER_TLV_FLAGS_MPDU_START |
++ 		     HTT_RX_FILTER_TLV_FLAGS_PPDU_END |
++@@ -9783,6 +9800,12 @@
++ 	if (!ab->hw_params->rxdma1_enable)
++ 		return ret;
++ 
+++	if (enable && !ath12k_mac_rx_mon_status_wanted(ar)) {
+++		ath12k_dbg(ab, ATH12K_DBG_MAC,
+++			   "rx monitor status ring left disabled\n");
+++		enable = false;
+++	}
+++
++ 	if (enable) {
++ 		tlv_filter = ath12k_mac_mon_status_filter_default;
++ 
+diff --git a/package/kernel/mac80211/patches/ath12k/952-wifi-ath12k-host-TX-flow-control.patch b/package/kernel/mac80211/patches/ath12k/952-wifi-ath12k-host-TX-flow-control.patch
+new file mode 100644
+index 0000000000..ad86f51047
+--- /dev/null
++++ b/package/kernel/mac80211/patches/ath12k/952-wifi-ath12k-host-TX-flow-control.patch
+@@ -0,0 +1,127 @@
++From: OpenWrt Xiaomi RD16 port
++Subject: [PATCH] wifi: ath12k: host-side TX flow control in 256 MiB mode
++
++ath12k picks the TX descriptor pool by access category and keeps feeding
++the firmware until that pool is empty; every frame in flight keeps its skb.
++On a 256 MiB board a Wi-Fi download OOM-killed userspace. Stop the mac80211
++queues at tx_pending_max frames in flight (3072 in LOW_256_M, unlimited
++elsewhere as before) and wake them at 3/4 of that.
++
++---
++--- a/drivers/net/wireless/ath/ath12k/core.c
+++++ b/drivers/net/wireless/ath/ath12k/core.c
++@@ -90,6 +90,11 @@
++ 			.rx_desc_count = 4096,
++ 			/* every entry pins an RX skb from probe on */
++ 			.rxdma_buf_ring_size = 1024,
+++			/* frames handed to firmware stay allocated until their
+++			 * completion; without a cap one radio could pin ~20 MiB
+++			 * of skbs (8192 per AC pool) and OOM the box
+++			 */
+++			.tx_pending_max = 3072,
++ 		},
++ 	},
++ };
++--- a/drivers/net/wireless/ath/ath12k/core.h
+++++ b/drivers/net/wireless/ath/ath12k/core.h
++@@ -943,6 +943,8 @@
++ 	u32 num_pool_tx_desc;
++ 	u32 rx_desc_count;
++ 	u32 rxdma_buf_ring_size;
+++	/* stop mac80211 queues at this many frames in flight (0: never) */
+++	u32 tx_pending_max;
++ };
++ 
++ struct ath12k_mem_profile_based_param {
++--- a/drivers/net/wireless/ath/ath12k/dp.h
+++++ b/drivers/net/wireless/ath/ath12k/dp.h
++@@ -155,6 +155,7 @@
++ 	u32 mac_id;
++ 	atomic_t num_tx_pending;
++ 	wait_queue_head_t tx_empty_waitq;
+++	unsigned long tx_flow_stopped;
++ 
++ 	struct ath12k_dp *dp;
++ 	struct ieee80211_hw *hw;
++--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
+++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
++@@ -207,7 +207,36 @@
++ 
++ 	ieee80211_free_txskb(ath12k_pdev_dp_to_hw(dp_pdev), msdu);
++ 
++-	if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
++-		wake_up(&dp_pdev->tx_empty_waitq);
+++	ath12k_dp_tx_pending_dec(dp_pdev);
++ }
++ EXPORT_SYMBOL(ath12k_dp_tx_free_txbuf);
+++
+++/* Host-side TX flow control: ath12k otherwise keeps pushing frames to the
+++ * firmware until a descriptor pool runs dry, and every frame in flight keeps
+++ * its skb allocated. Stop the mac80211 queues at tx_pending_max frames and
+++ * wake them again at 3/4 of that.
+++ */
+++void ath12k_dp_tx_pending_inc(struct ath12k_pdev_dp *dp_pdev)
+++{
+++	u32 max = dp_pdev->dp->ab->profile_param->dp_params.tx_pending_max;
+++	int n = atomic_inc_return(&dp_pdev->num_tx_pending);
+++
+++	if (max && n >= max &&
+++	    !test_and_set_bit(0, &dp_pdev->tx_flow_stopped))
+++		ieee80211_stop_queues(ath12k_pdev_dp_to_hw(dp_pdev));
+++}
+++EXPORT_SYMBOL(ath12k_dp_tx_pending_inc);
+++
+++void ath12k_dp_tx_pending_dec(struct ath12k_pdev_dp *dp_pdev)
+++{
+++	u32 max = dp_pdev->dp->ab->profile_param->dp_params.tx_pending_max;
+++	int n = atomic_dec_return(&dp_pdev->num_tx_pending);
+++
+++	if (!n)
+++		wake_up(&dp_pdev->tx_empty_waitq);
+++
+++	if (max && n <= (max * 3) / 4 &&
+++	    test_and_clear_bit(0, &dp_pdev->tx_flow_stopped))
+++		ieee80211_wake_queues(ath12k_pdev_dp_to_hw(dp_pdev));
+++}
+++EXPORT_SYMBOL(ath12k_dp_tx_pending_dec);
++--- a/drivers/net/wireless/ath/ath12k/dp_tx.h
+++++ b/drivers/net/wireless/ath/ath12k/dp_tx.h
++@@ -29,4 +29,7 @@
++ void ath12k_dp_tx_free_txbuf(struct ath12k_dp *dp,
++ 			     struct dp_tx_ring *tx_ring,
++ 			     struct ath12k_tx_desc_params *desc_params);
+++void ath12k_dp_tx_pending_inc(struct ath12k_pdev_dp *dp_pdev);
+++void ath12k_dp_tx_pending_dec(struct ath12k_pdev_dp *dp_pdev);
+++
++ #endif
++--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++@@ -382,7 +382,7 @@
++ 	ath12k_dbg_dump(ab, ATH12K_DBG_DP_TX, NULL, "dp tx msdu: ",
++ 			skb->data, skb->len);
++ 
++-	atomic_inc(&dp_pdev->num_tx_pending);
+++	ath12k_dp_tx_pending_inc(dp_pdev);
++ 
++ 	return 0;
++ 
++@@ -444,8 +444,7 @@
++ 
++ 	dp->device_stats.tx_completed[tx_ring->tcl_data_ring_id]++;
++ 
++-	if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
++-		wake_up(&dp_pdev->tx_empty_waitq);
+++	ath12k_dp_tx_pending_dec(dp_pdev);
++ 
++ 	dma_unmap_single(dp->dev, skb_cb->paddr, msdu->len, DMA_TO_DEVICE);
++ 	if (skb_cb->paddr_ext_desc) {
++@@ -948,8 +947,7 @@
++ 			continue;
++ 		}
++ 
++-		if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
++-			wake_up(&dp_pdev->tx_empty_waitq);
+++		ath12k_dp_tx_pending_dec(dp_pdev);
++ 
++ 		ath12k_wifi7_dp_tx_complete_msdu(dp_pdev, &desc_params, &ts,
++ 						 tx_ring->tcl_data_ring_id);
+-- 
+2.43.0
+

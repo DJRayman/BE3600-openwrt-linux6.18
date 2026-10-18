@@ -1,0 +1,116 @@
+From 13f144a0a44cef1a60d8da4a61ae13c758cf2ef4 Mon Sep 17 00:00:00 2001
+From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
+Date: Sun, 18 Oct 2026 13:03:44 +0300
+Subject: [PATCH 1/4] qualcommbe: ipq53xx: SPI-NAND: W25N01KW support, fix QPIC
+ SET_FEATURE order
+
+- winbond: add the W25N01KW (128 MiB, 1.8 V) used on the Xiaomi BE3600.
+- qcom snand: program the feature value before issuing SET_FEATURE;
+  otherwise the config write lands one command late and every read on
+  this flash fails with -EBADMSG (backport of upstream 8fd62901d6bf).
+---
+ ...100-mtd-spinand-winbond-add-W25N01KW.patch | 31 +++++++++++
+ ...d-program-feature-before-SET_FEATURE.patch | 53 +++++++++++++++++++
+ 2 files changed, 84 insertions(+)
+ create mode 100644 target/linux/qualcommbe/patches-6.18/9100-mtd-spinand-winbond-add-W25N01KW.patch
+ create mode 100644 target/linux/qualcommbe/patches-6.18/9101-spi-spi-qpic-snand-program-feature-before-SET_FEATURE.patch
+
+diff --git a/target/linux/qualcommbe/patches-6.18/9100-mtd-spinand-winbond-add-W25N01KW.patch b/target/linux/qualcommbe/patches-6.18/9100-mtd-spinand-winbond-add-W25N01KW.patch
+new file mode 100644
+index 0000000000..8eaef03ac6
+--- /dev/null
++++ b/target/linux/qualcommbe/patches-6.18/9100-mtd-spinand-winbond-add-W25N01KW.patch
+@@ -0,0 +1,31 @@
++From: OpenWrt RD16 port
++Subject: [PATCH] mtd: spinand: winbond: add W25N01KW
++
++Add the Winbond W25N01KW 1.8 V 1 Gbit SPI NAND used by the Xiaomi
++BE3600 (RD16): 2048 + 64 byte pages, 64 pages per 128 KiB block,
++1024 blocks, 4-bit/512 on-die ECC.
++
++---
++diff --git a/drivers/mtd/nand/spi/winbond.c b/drivers/mtd/nand/spi/winbond.c
++index 4870b2d..9899dd0 100644
++--- a/drivers/mtd/nand/spi/winbond.c
+++++ b/drivers/mtd/nand/spi/winbond.c
++@@ -440,6 +440,18 @@ static const struct spinand_info winbond_spinand_table[] = {
++ 					      &update_cache_variants),
++ 		     0,
++ 		     SPINAND_ECCINFO(&w25n01kv_ooblayout, w25n02kv_ecc_get_status)),
+++	SPINAND_INFO("W25N01KW", /* 1.8V */
+++		     /* Xiaomi BE3600 RD16: "Manufacturer ID: 0xef, Chip ID: 0xbe",
+++		      * 128 MiB, 2048 + 64, 128 KiB blocks (stock QSDK log).
+++		      */
+++		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0xbe, 0x21),
+++		     NAND_MEMORG(1, 2048, 64, 64, 1024, 20, 1, 1, 1),
+++		     NAND_ECCREQ(4, 512),
+++		     SPINAND_INFO_OP_VARIANTS(&read_cache_variants,
+++					      &write_cache_variants,
+++					      &update_cache_variants),
+++		     0,
+++		     SPINAND_ECCINFO(&w25m02gv_ooblayout, w25n02kv_ecc_get_status)),
++ 	SPINAND_INFO("W35N01JW", /* 1.8V */
++ 		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0xdc, 0x21),
++ 		     NAND_MEMORG(1, 4096, 128, 64, 512, 10, 1, 1, 1),
+diff --git a/target/linux/qualcommbe/patches-6.18/9101-spi-spi-qpic-snand-program-feature-before-SET_FEATURE.patch b/target/linux/qualcommbe/patches-6.18/9101-spi-spi-qpic-snand-program-feature-before-SET_FEATURE.patch
+new file mode 100644
+index 0000000000..726f817f85
+--- /dev/null
++++ b/target/linux/qualcommbe/patches-6.18/9101-spi-spi-qpic-snand-program-feature-before-SET_FEATURE.patch
+@@ -0,0 +1,53 @@
++From: OpenWrt RD16 port
++Subject: [PATCH] spi: spi-qpic-snand: program the feature value before SET_FEATURE
++
++Backport of upstream 8fd62901d6bf ("spi: spi-qpic-snand: write the
++feature value before executing SET_FEATURE"), re-done on 6.18.
++
++qcom_spi_send_cmdaddr() executed the SET_FEATURE command before
++qcom_spi_io_op() wrote the value to NAND_FLASH_FEATURES, so every
++feature write reached the chip one operation late. On the Xiaomi RD16
++(W25N01KW) this leaves the chip configuration (on-die ECC enable,
++BUF mode) as U-Boot left it instead of what spinand requested, and
++every page read with the QPIC host ECC fails in the last codeword
++(the part that sits in the chip spare area) with -EBADMSG.
++
++---
++diff --git a/drivers/spi/spi-qpic-snand.c b/drivers/spi/spi-qpic-snand.c
++index 58ceea1..bd03bf1 100644
++--- a/drivers/spi/spi-qpic-snand.c
+++++ b/drivers/spi/spi-qpic-snand.c
++@@ -1362,6 +1362,20 @@ static int qcom_spi_send_cmdaddr(struct qcom_nand_controller *snandc,
++ 	snandc->regs->addr0 = cpu_to_le32(op->addr.val);
++ 	snandc->regs->addr1 = cpu_to_le32(0);
++ 
+++	/*
+++	 * The feature value has to reach NAND_FLASH_FEATURES before the
+++	 * command is executed, otherwise the chip is programmed with the
+++	 * value of the previous SET_FEATURE operation.
+++	 */
+++	if (opcode == SPINAND_SET_FEATURE) {
+++		u32 val = 0;
+++
+++		memcpy(&val, op->data.buf.out, min_t(unsigned int, op->data.nbytes, sizeof(val)));
+++		snandc->regs->flash_feature = cpu_to_le32(val);
+++		qcom_write_reg_dma(snandc, &snandc->regs->flash_feature,
+++				   NAND_FLASH_FEATURES, 1, NAND_BAM_NEXT_SGL);
+++	}
+++
++ 	qcom_write_reg_dma(snandc, &snandc->regs->cmd, NAND_FLASH_CMD, 3, NAND_BAM_NEXT_SGL);
++ 	qcom_write_reg_dma(snandc, &snandc->regs->exec, NAND_EXEC_CMD, 1, NAND_BAM_NEXT_SGL);
++ 
++@@ -1399,10 +1413,8 @@ static int qcom_spi_io_op(struct qcom_nand_controller *snandc, const struct spi_
++ 		copy_ftr = true;
++ 		break;
++ 	case SPINAND_SET_FEATURE:
++-		snandc->regs->flash_feature = cpu_to_le32(*(u32 *)op->data.buf.out);
++-		qcom_write_reg_dma(snandc, &snandc->regs->flash_feature,
++-				   NAND_FLASH_FEATURES, 1, NAND_BAM_NEXT_SGL);
++-		break;
+++		/* fully handled by qcom_spi_send_cmdaddr() */
+++		return 0;
++ 	case SPINAND_PROGRAM_EXECUTE:
++ 	case SPINAND_WRITE_EN:
++ 	case SPINAND_RESET:
+-- 
+2.43.0
+

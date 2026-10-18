@@ -1,0 +1,947 @@
+From 136ef0093d9f48481157a5a94bd924096115ee56 Mon Sep 17 00:00:00 2001
+From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
+Date: Sun, 18 Oct 2026 13:04:21 +0300
+Subject: [PATCH 4/4] qualcommbe: ipq53xx: add support for Xiaomi BE3600 (RD16)
+
+Hardware: IPQ5332 (4x A53), 256 MiB RAM, 128 MiB W25N01KW SPI-NAND,
+Motorcomm YT9215S switch (1x WAN + 3x LAN gigabit), 2.4 GHz IPQ5332 +
+5 GHz QCN6432 Wi-Fi 7 (ath12k, hybrid AHB).
+
+Installed into system slot A ("rootfs" MTD) only; slot B ("rootfs_1")
+keeps the stock firmware and the stock U-Boot (bootmiwifi) falls back to
+it after failed boots.
+
+- DTS: NAND layout, switch, MACs from the U-Boot env, Wi-Fi (Q6 regions
+  of the stock 256 MiB layout, memory mode 2, stock boot-args), reserved
+  memory trimmed to what the stock DTB reserves;
+- image: lzma FIT in UBI (kernel/rootfs/rootfs_data), factory.ubi and
+  sysupgrade.bin; sysupgrade writes slot A and points U-Boot at it;
+- base-files: U-Boot env, boot-OK flag reset, min_free_kbytes 8 MiB,
+  no Q6 coredumps, Wi-Fi-less RAM-boot image, RPS + IRQ placement for
+  the single EDMA RX ring, Wi-Fi defaults (RU, HE, 5 GHz ch 36,
+  4 MiB mac80211 queue limit).
+---
+ .../uboot-envtools/files/qualcommbe_ipq53xx   |   5 +
+ .../qualcommbe/dts/ipq5332-xiaomi-rd16.dts    | 540 ++++++++++++++++++
+ target/linux/qualcommbe/image/ipq53xx.mk      |  27 +
+ .../ipq53xx/base-files/etc/board.d/02_network |  10 +
+ .../etc/hotplug.d/firmware/12-ath12k-caldata  |   4 +-
+ .../etc/hotplug.d/ieee80211/12-rd16-wifi      |  42 ++
+ .../ipq53xx/base-files/etc/init.d/rd16-mem    |  12 +
+ .../base-files/etc/init.d/xiaomi-bootok       |  26 +
+ .../lib/preinit/79_rd16_initramfs_nowifi      |  15 +
+ .../lib/preinit/81_rd16_rproc_coredump        |  17 +
+ .../base-files/lib/upgrade/platform.sh        |  50 +-
+ .../usr/libexec/platform/packet-steering.sh   |  30 +
+ 12 files changed, 775 insertions(+), 3 deletions(-)
+ create mode 100644 target/linux/qualcommbe/dts/ipq5332-xiaomi-rd16.dts
+ create mode 100755 target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/ieee80211/12-rd16-wifi
+ create mode 100755 target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/rd16-mem
+ create mode 100755 target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/xiaomi-bootok
+ create mode 100644 target/linux/qualcommbe/ipq53xx/base-files/lib/preinit/79_rd16_initramfs_nowifi
+ create mode 100644 target/linux/qualcommbe/ipq53xx/base-files/lib/preinit/81_rd16_rproc_coredump
+
+diff --git a/package/boot/uboot-tools/uboot-envtools/files/qualcommbe_ipq53xx b/package/boot/uboot-tools/uboot-envtools/files/qualcommbe_ipq53xx
+index 32c7527a70..ddaea0d3f3 100644
+--- a/package/boot/uboot-tools/uboot-envtools/files/qualcommbe_ipq53xx
++++ b/package/boot/uboot-tools/uboot-envtools/files/qualcommbe_ipq53xx
+@@ -11,6 +11,11 @@ case "$board" in
+ gl.inet,gl-be6500)
+ 	ubootenv_add_mtd "0:appsblenv" "0x0" "0x40000" "0x40000"
+ 	;;
++xiaomi,rd16)
++	# stock U-Boot: "Environment size: .../65532" -> 64 KiB env,
++	# 128 KiB erase blocks, 0:appsblenv is 512 KiB
++	ubootenv_add_mtd "0:appsblenv" "0x0" "0x10000" "0x20000"
++	;;
+ esac
+ 
+ config_load ubootenv
+diff --git a/target/linux/qualcommbe/dts/ipq5332-xiaomi-rd16.dts b/target/linux/qualcommbe/dts/ipq5332-xiaomi-rd16.dts
+new file mode 100644
+index 0000000000..5a1ce0a14a
+--- /dev/null
++++ b/target/linux/qualcommbe/dts/ipq5332-xiaomi-rd16.dts
+@@ -0,0 +1,540 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
++/*
++ * Xiaomi Router BE3600 (RD16)
++ *
++ * IPQ5312 (IPQ5332 family) / AP-MI04.1-C2, same reference board as the
++ * GL.iNet GL-BE3600, but the low-memory variant:
++ * - 256 MiB DDR (Linux sees ~192 MiB), 128 MiB parallel NAND (2k/128k),
++ *   partitions from SMEM, A/B system slots "rootfs" / "rootfs_1".
++ * - Ethernet: no discrete PHY. PPE port 2 (uniphy1) runs 2500base-x
++ *   (QSDK "SGMII_PLUS", forced 2500/full) into a Motorcomm YT9215S switch,
++ *   SMI address 0x1d on the IPQ MDIO bus, hardware reset on GPIO51.
++ *   Front ports: switch ports 0..2 = LAN4/LAN1/LAN2, port 3 = WAN.
++ *   PPE port 1 (uniphy0) is unpopulated on RD16 (RD15 has a 2.5G PHY there).
++ * - Wi-Fi: on-SoC 2.4 GHz (board-id 0x13) + QCN6432 5 GHz as Q6 user PD 2
++ *   (board-id 0x60). Stock "low-mem" Q6 memory map below.
++ *   Calibration lives in "0:art" at the stock ftm.conf AP-MI04.1-C2
++ *   offsets (IPQ5332 0x1000/0x11800, QCN6432 0x12800/0x1b800), same
++ *   layout as GL-BE3600; extracted by hotplug 12-ath12k-caldata.
++ * - LEDs: PWM RGB (blue = pwm ch2 / gpio30, orange = pwm ch1 / gpio31).
++ * - Buttons: reset GPIO43, mesh/WPS GPIO35 (both active low).
++ *
++ * All facts are taken from the stock QSDK 5.4 DTB and the stock boot log.
++ *
++ * Status: boots from slot A (UBI + squashfs), YT9215S via the yt921x DSA
++ * driver (wan, lan1, lan2, lan3). Wi-Fi: stock RD16 Q6 firmware (installed
++ * into files/ by stock-wifi-fw.py of the build project) in the 256 MiB memory mode,
++ * stock boot-args. Both radios verified on hardware (stock WLAN.WBE.1.3.r4
++ * in mode 2): 2.4 GHz HE20, 5 GHz HE80 ~600 Mbit/s TCP.
++ */
++
++/dts-v1/;
++
++#include <arm64/qcom/ipq5332.dtsi>
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/leds/common.h>
++#include <dt-bindings/clock/qcom,ipq5332-nsscc.h>
++
++/ {
++	#address-cells = <0x2>;
++	#size-cells = <0x2>;
++	model = "Xiaomi Router BE3600 (RD16)";
++	compatible = "xiaomi,rd16", "qcom,ipq5332";
++
++	aliases {
++		serial0 = &blsp1_uart0;
++		led-boot = &led_status_blue;
++		led-failsafe = &led_status_orange;
++		led-running = &led_status_blue;
++		led-upgrade = &led_status_orange;
++		label-mac-device = &cpu_port;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++		/* Stock U-Boot (bootmiwifi) passes
++		 * "ubi.mtd=rootfs root=mtd:ubi_rootfs rootfstype=squashfs";
++		 * ubi.mtd attaches slot A, the appended root= (last one wins)
++		 * points at the OpenWrt "rootfs" volume (vol 1).
++		 * clk_ignore_unused: as stock, the late clk-disable pass kills
++		 * U-Boot-enabled buses on this platform.
++		 */
++		bootargs-append = " root=/dev/ubiblock0_1 clk_ignore_unused";
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* No tzapp region: the stock tzapp@49B00000 node has no reg (U-Boot
++		 * does not fix it up either), so stock Linux uses that RAM, and
++		 * TZ apps are only loaded there via QSEECOM, which is not built.
++		 */
++
++		/* The dtsi reserves 4 MiB at 0x4a100000 for the bootloader; the
++		 * stock RD16 DTB only reserves uboot@4A300000 (2 MiB), so stock
++		 * Linux uses 0x4a100000..0x4a300000 as RAM. Give those 2 MiB back.
++		 */
++		/delete-node/ bootloader@4a100000;
++
++		uboot@4a300000 {
++			reg = <0x0 0x4a300000 0x0 0x200000>;
++			no-map;
++		};
++
++		/* Stock low-mem Q6 map (q6_mem_regions 0x4a900000..0x4e000000):
++		 *   0x4a900000 +0x1400000  Q6 root PD code + data  (q6_code_data)
++		 *   0x4bd00000 +0x0f00000  PD1 (IPQ5332 2.4G) data, BDF at start
++		 *                          (also holds both iu_fw images)
++		 *   0x4cc00000 +0x0100000  m3 dump
++		 *   0x4cd00000 +0x0100000  etr dump
++		 *   0x4ce00000 +0x1000000  PD2 (QCN6432 5G) data, BDF at start
++		 *   0x4de00000 +0x0100000  m3 dump QCN6432
++		 *   0x4df00000 +0x0100000  etr QCN6432
++		 *   0x4e000000 +0x0700000  MLO global memory
++		 *   0x4e700000 +0x0080000  rsvd1
++		 * Stock has no separate caldb region (cold-boot calibration off);
++		 * its PD1 caldb-addr points at 0x4ce00000.
++		 * q6_region (below) spans root PD code + PD1 data in one piece:
++		 * the iu_fw images are linked at 0x4bd40000 (IPQ5332) and
++		 * 0x4bd94000 (QCN6432), and ath12k loads every MDT relative to
++		 * "q6-region" ("segment outside memory range" otherwise).
++		 */
++
++		m3_dump: m3-dump@4cc00000 {
++			reg = <0x0 0x4cc00000 0x0 0x100000>;
++			no-map;
++		};
++
++		q6_etr: q6-etr-dump@4cd00000 {
++			reg = <0x0 0x4cd00000 0x0 0x100000>;
++			no-map;
++		};
++
++		q6_qcn6432_data: q6-qcn6432-data@4ce00000 {
++			reg = <0x0 0x4ce00000 0x0 0x1000000>;
++			no-map;
++		};
++
++		m3_dump_qcn6432: m3-dump-qcn6432@4de00000 {
++			reg = <0x0 0x4de00000 0x0 0x100000>;
++			no-map;
++		};
++
++		q6_qcn6432_etr: q6-qcn6432-etr@4df00000 {
++			reg = <0x0 0x4df00000 0x0 0x100000>;
++			no-map;
++		};
++
++		mlo_mem: mlo-global-mem@4e000000 {
++			reg = <0x0 0x4e000000 0x0 0x0700000>;
++			no-map;
++		};
++
++		rsvd1: rsvd1@4e700000 {
++			reg = <0x0 0x4e700000 0x0 0x0080000>;
++			no-map;
++		};
++
++		/* Crash log that survives a warm reset; read from /sys/fs/pstore. */
++		ramoops@4e780000 {
++			compatible = "ramoops";
++			reg = <0x0 0x4e780000 0x0 0x80000>;
++			record-size = <0x20000>;
++			console-size = <0x40000>;
++			pmsg-size = <0>;
++			ecc-size = <0>;
++		};
++	};
++
++	soc@0 {
++		/* QCN6432 5 GHz radio: Q6 user PD 2 (ath12k hybrid-bus patch).
++		 * Caldata: "0:art" 0x12800, region 0x1b800 (block 0x18800 on the
++		 * test unit), stock ftm.conf "ap-mi04.1-c2,0060,1,75776,112640".
++		 */
++		wifi1: wifi-qcn6432 {
++			compatible = "qcom,qcn6432-wifi";
++			msi-parent = <&v2m0>;
++			interrupts-extended = <&smp2p_wcss_in 16 IRQ_TYPE_NONE>,
++					      <&smp2p_wcss_in 17 IRQ_TYPE_NONE>,
++					      <&smp2p_wcss_in 20 IRQ_TYPE_NONE>,
++					      <&smp2p_wcss_in 19 IRQ_TYPE_NONE>;
++			interrupt-names = "fatal",
++					  "ready",
++					  "spawn",
++					  "stop-ack";
++			qcom,smem-states = <&smp2p_wcss_out 16>,
++					   <&smp2p_wcss_out 17>,
++					   <&smp2p_wcss_out 18>;
++			qcom,smem-state-names = "shutdown",
++						"stop",
++						"spawn";
++			firmware-name = "ath12k/QCN6432/hw1.0/q6_fw2.mdt",
++					"ath12k/QCN6432/hw1.0/iu_fw.mdt";
++			memory-region = <&q6_region>, <&m3_dump_qcn6432>,
++					<&q6_qcn6432_data>, <&mlo_mem>,
++					<&q6_qcn6432_data>;
++			memory-region-names = "q6-region", "m3-dump", "q6-caldb",
++					      "mlo-global-mem", "host-ddr-mem";
++			qcom,bdf-address-offset = <0>;
++			qcom,board-id = <0x60>;
++			/* QSDK "qcom,tgt-mem-mode = <2>": 256 MiB firmware profile */
++			qcom,ath12k-fw-memory-mode = <2>;
++			qcom,legacy-userpd-bootinfo;
++			qcom,rproc = <&q6v5_wcss>;
++			status = "okay";
++		};
++
++		gpio_keys {
++			compatible = "gpio-keys";
++			pinctrl-0 = <&button_pins>;
++			pinctrl-names = "default";
++
++			reset {
++				label = "reset";
++				linux,code = <KEY_RESTART>;
++				gpios = <&tlmm 43 GPIO_ACTIVE_LOW>;
++				debounce-interval = <60>;
++			};
++
++			wps {
++				label = "mesh";
++				linux,code = <KEY_WPS_BUTTON>;
++				gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
++				debounce-interval = <60>;
++			};
++		};
++
++		leds {
++			compatible = "pwm-leds";
++
++			led_status_blue: led-0 {
++				color = <LED_COLOR_ID_BLUE>;
++				function = LED_FUNCTION_STATUS;
++				pwms = <&pwm 2 50000>;
++				max-brightness = <255>;
++			};
++
++			led_status_orange: led-1 {
++				color = <LED_COLOR_ID_ORANGE>;
++				function = LED_FUNCTION_STATUS;
++				pwms = <&pwm 1 50000>;
++				max-brightness = <255>;
++			};
++		};
++	};
++};
++
++&blsp1_uart0 {
++	pinctrl-0 = <&serial_0_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++&pwm {
++	#pwm-cells = <2>;
++	pinctrl-0 = <&pwm_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++&tlmm {
++	/* QSPI serial NAND (Winbond W25N01KW, 1.8 V), as stock */
++	qspi_nand_pins: qspi-nand-state {
++		qspi-clock-pins {
++			pins = "gpio13";
++			function = "qspi_clk";
++			drive-strength = <8>;
++			bias-disable;
++		};
++
++		qspi-cs-pins {
++			pins = "gpio12";
++			function = "qspi_cs";
++			drive-strength = <8>;
++			bias-disable;
++		};
++
++		qspi-data-pins {
++			pins = "gpio8", "gpio9", "gpio10", "gpio11";
++			function = "qspi_data";
++			drive-strength = <8>;
++			bias-disable;
++		};
++	};
++
++	switch_reset_pins: switch-reset-state {
++		pins = "gpio51";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-disable;
++	};
++
++	button_pins: button-state {
++		pins = "gpio35", "gpio43";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-pull-up;
++	};
++
++	/* Stock: orange = pwm ch1 (gpio31), blue = ch2 (gpio30). Upstream
++	 * pinctrl names the mux function after the pin bank (gpio29..32 =
++	 * "pwm1"), not the channel as QSDK did.
++	 */
++	pwm_pins: pwm-state {
++		pins = "gpio30", "gpio31";
++		function = "pwm1";
++		drive-strength = <8>;
++	};
++};
++
++/* Stock MDIO uses both pin groups (mdio1 gpio27/28 + mdio0 gpio25/26), as
++ * the dtsi default. GPIO51 is the YT9215S hardware reset (stock mdio node:
++ * phy-reset-gpio = <&tlmm 51 0>, driven high to run). After a normal
++ * boot U-Boot leaves it an input, low (switch in reset); the yt921x
++ * driver pulses it (the MDIO core only drives reset-gpios for PHYs).
++ */
++&mdio {
++	status = "okay";
++
++	/* Motorcomm YT9215S, SMI 0x1d. Front ports, left to right as seen
++	 * from the back (verified by plugging a cable into each):
++	 *   1 = PHY 3 (WAN), 2 = PHY 2, 3 = PHY 1, 4 = PHY 0; PHY 4 unused.
++	 * Named wan, lan1, lan2, lan3 in that order (the stock Xiaomi port
++	 * map called them WAN, LAN2, LAN1, LAN4). CPU: GMAC 8, 2.5G SerDes
++	 * to PPE port 2.
++	 */
++	switch@1d {
++		compatible = "motorcomm,yt9215";
++		reg = <0x1d>;
++		reset-gpios = <&tlmm 51 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&switch_reset_pins>;
++		pinctrl-names = "default";
++
++		mdio {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			sw_phy0: phy@0 {
++				reg = <0x0>;
++			};
++
++			sw_phy1: phy@1 {
++				reg = <0x1>;
++			};
++
++			sw_phy2: phy@2 {
++				reg = <0x2>;
++			};
++
++			sw_phy3: phy@3 {
++				reg = <0x3>;
++			};
++		};
++
++		ethernet-ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			ethernet-port@0 {
++				reg = <0>;
++				label = "lan3";
++				phy-mode = "internal";
++				phy-handle = <&sw_phy0>;
++			};
++
++			ethernet-port@1 {
++				reg = <1>;
++				label = "lan2";
++				phy-mode = "internal";
++				phy-handle = <&sw_phy1>;
++			};
++
++			ethernet-port@2 {
++				reg = <2>;
++				label = "lan1";
++				phy-mode = "internal";
++				phy-handle = <&sw_phy2>;
++			};
++
++			ethernet-port@3 {
++				reg = <3>;
++				label = "wan";
++				phy-mode = "internal";
++				phy-handle = <&sw_phy3>;
++				nvmem-cells = <&macaddr_uboot_ethaddr 1>;
++				nvmem-cell-names = "mac-address";
++			};
++
++			ethernet-port@8 {
++				reg = <8>;
++				phy-mode = "2500base-x";
++				ethernet = <&cpu_port>;
++
++				fixed-link {
++					speed = <2500>;
++					full-duplex;
++				};
++			};
++		};
++	};
++};
++
++&qcom_ppe {
++	status = "okay";
++
++	ethernet-ports {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/* DSA conduit into the YT9215S GMAC 8. Stock: PPE port 2,
++		 * uniphy1 in SGMII_PLUS, forced 2500 Mbit/s full duplex.
++		 */
++		cpu_port: port@2 {
++			reg = <2>;
++			phy-mode = "2500base-x";
++			label = "eth0";
++			pcs-handle = <&pcs1_ch0>;
++			/* LAN MAC = U-Boot "ethaddr" (a4:ba:70:..:68 on the test unit);
++			 * DSA LAN ports inherit it, WAN uses +1, radios +2/+3 (stock).
++			 */
++			nvmem-cells = <&macaddr_uboot_ethaddr 0>;
++			nvmem-cell-names = "mac-address";
++			clocks = <&nsscc NSS_CC_PORT2_MAC_CLK>,
++				 <&nsscc NSS_CC_PORT2_RX_CLK>,
++				 <&nsscc NSS_CC_PORT2_TX_CLK>;
++			clock-names = "mac",
++				      "rx",
++				      "tx";
++			resets = <&nsscc NSS_CC_PORT2_MAC_CLK_ARES>,
++				 <&nsscc NSS_CC_PORT2_RX_CLK_ARES>,
++				 <&nsscc NSS_CC_PORT2_TX_CLK_ARES>;
++			reset-names = "mac",
++				      "rx",
++				      "tx";
++
++			fixed-link {
++				speed = <2500>;
++				full-duplex;
++			};
++		};
++	};
++};
++
++&pcs1 {
++	status = "okay";
++};
++
++&qpic_nand {
++	pinctrl-0 = <&qspi_nand_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	flash@0 {
++		compatible = "spi-nand";
++		reg = <0>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++		nand-ecc-engine = <&qpic_nand>;
++		nand-ecc-strength = <4>;
++		nand-ecc-step-size = <512>;
++
++		partitions {
++			compatible = "qcom,smem-part";
++
++			/* U-Boot env: also written by fw_setenv, so not read-only */
++			partition-0-appsblenv {
++				label = "0:appsblenv";
++
++				nvmem-layout {
++					compatible = "u-boot,env";
++					env-size = <0x10000>;
++
++					macaddr_uboot_ethaddr: ethaddr {
++						#nvmem-cell-cells = <1>;
++					};
++				};
++			};
++
++			/* Wi-Fi caldata source (read by 12-ath12k-caldata) */
++			partition-0-art {
++				label = "0:art";
++				read-only;
++			};
++
++			/* Slot A "rootfs" is the only system slot OpenWrt owns;
++			 * slot B ("rootfs_1") keeps the stock firmware. Neither is
++			 * auto-attached during bring-up: with the QPIC host ECC,
++			 * slot A's QSDK-written UBI reads back with ECC errors
++			 * (-74) - under investigation (on-die vs host ECC layout).
++			 */
++
++			partition-bdata {
++				label = "bdata";
++				read-only;
++			};
++		};
++	};
++};
++
++&qpic_bam {
++	status = "okay";
++};
++
++&ref_48mhz_clk {
++	clock-div = <1>;
++	clock-mult = <1>;
++};
++
++&sleep_clk {
++	clock-frequency = <32000>;
++};
++
++&xo_board {
++	clock-div = <2>;
++	clock-mult = <1>;
++};
++
++&xo_clk {
++	clock-frequency = <48000000>;
++};
++
++/* Root PD code + data (stock q6_code_data 0x4a900000 + 0x1400000) plus
++ * PD1 data (stock q6_ipq5332_data 0x4bd00000 + 0xf00000): q6_fw0/1/2 and
++ * both iu_fw images must all load inside this one region.
++ */
++&q6_region {
++	reg = <0x0 0x4a900000 0x0 0x2300000>;
++};
++
++/* Integrated 2.4 GHz radio (Q6 user PD 1).
++ * Caldata: "0:art" 0x1000, region 0x11800 (block 0xf800 on the test
++ * unit), stock ftm.conf "ap-mi04.1-c2,13,0,4096,71680".
++ */
++&wifi0 {
++	firmware-name = "ath12k/IPQ5332/hw1.0/q6_fw1.mdt",
++			"ath12k/IPQ5332/hw1.0/iu_fw.mdt";
++	memory-region = <&q6_region>, <&m3_dump>, <&q6_qcn6432_data>, <&mlo_mem>;
++	memory-region-names = "q6-region", "m3-dump", "q6-caldb", "mlo-global-mem";
++	/* PD1 board data at 0x4bd00000 = q6_region + 0x1400000 (stock bdf-addr) */
++	qcom,bdf-address-offset = <0x1400000>;
++	qcom,board-id = <0x13>;
++	/* QSDK "qcom,tgt-mem-mode = <2>": 256 MiB firmware profile */
++	qcom,ath12k-fw-memory-mode = <2>;
++	qcom,legacy-userpd-bootinfo;
++	qcom,rproc = <&q6v5_wcss>;
++	status = "okay";
++};
++
++&q6v5_wcss {
++	firmware-name = "ath12k/IPQ5332/hw1.0/q6_fw0.mdt";
++	/* Stock RD16 boot-args record (QSDK bootargs version 2, SMEM 0x1fb):
++	 * type 1, length 4, payload 3 1 0x2f 2. The GL-BE3600 record
++	 * (length 5) made the RD16 firmware assert "err_smem_ver.2.1".
++	 */
++	boot-args = <1 4 3 1 0x2f 2>;
++	status = "okay";
++};
+diff --git a/target/linux/qualcommbe/image/ipq53xx.mk b/target/linux/qualcommbe/image/ipq53xx.mk
+index b03277fc33..8790f7380a 100644
+--- a/target/linux/qualcommbe/image/ipq53xx.mk
++++ b/target/linux/qualcommbe/image/ipq53xx.mk
+@@ -162,3 +162,30 @@ define Device/glinet_gl-be9300
+ 		block-mount blockd usbutils
+ endef
+ TARGET_DEVICES += glinet_gl-be9300
++
++define Device/xiaomi_rd16
++	# Stock Xiaomi U-Boot (bootmiwifi) loads the FIT from the UBI volume
++	# "kernel" on the "rootfs" MTD (system slot A) and boots its default
++	# configuration; the stock FIT is lzma with config@1.
++	$(call Device/FitImageLzma)
++	$(call Device/UbiFit)
++	DEVICE_VENDOR := Xiaomi
++	DEVICE_MODEL := Router BE3600
++	DEVICE_VARIANT := RD16
++	DEVICE_DTS := ipq5332-xiaomi-rd16
++	DEVICE_DTS_CONFIG := config@1
++	SOC := ipq5332
++	SUPPORTED_DEVICES += xiaomi,rd16
++	BLOCKSIZE := 128k
++	PAGESIZE := 2048
++	KERNEL_INSTALL := 1
++	KERNEL_SIZE := 6144k
++	# Slot A "rootfs" MTD is 0x2a00000 (42 MiB); slot B "rootfs_1" keeps
++	# the stock firmware and is never written.
++	IMAGE_SIZE := 43008k
++	NAND_SIZE := 128m
++	# Wi-Fi: the Q6 firmware and board data come from the stock RD16 rootfs
++	# via files/ (stock-wifi-fw.py in the RD16 build project), not from a package.
++	DEVICE_PACKAGES := kmod-leds-pwm kmod-ath12k ath12k-firmware-ipq5332 wifi-scripts
++endef
++TARGET_DEVICES += xiaomi_rd16
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/etc/board.d/02_network b/target/linux/qualcommbe/ipq53xx/base-files/etc/board.d/02_network
+index 3d4a1c0c4e..a4e7be1924 100644
+--- a/target/linux/qualcommbe/ipq53xx/base-files/etc/board.d/02_network
++++ b/target/linux/qualcommbe/ipq53xx/base-files/etc/board.d/02_network
+@@ -51,6 +51,16 @@ ipq53xx_setup_interfaces()
+ 	gl.inet,gl-be9300)
+ 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"
+ 		;;
++	xiaomi,rd16)
++		# YT9215S front ports via DSA; MACs come from the U-Boot env
++		# (nvmem) in the DTS: LAN = ethaddr, WAN = ethaddr + 1.
++		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
++		# Test defaults: both APs come up on first boot (see also
++		# /etc/hotplug.d/ieee80211/12-rd16-wifi: HE, 5 GHz on channel 36).
++		ucidef_set_country "RU"
++		ucidef_set_wireless 2g "Xiaomi-BE3600-2.4G" psk2 "12345678"
++		ucidef_set_wireless 5g "Xiaomi-BE3600-5G" psk2 "12345678"
++		;;
+ 	*)
+ 		echo "Unsupported hardware. Network interfaces not initialized"
+ 		;;
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/firmware/12-ath12k-caldata b/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/firmware/12-ath12k-caldata
+index ef0e32e31e..3e36324675 100644
+--- a/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/firmware/12-ath12k-caldata
++++ b/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/firmware/12-ath12k-caldata
+@@ -7,7 +7,7 @@ board=$(board_name)
+ case "$FIRMWARE" in
+ "ath12k/IPQ5332/hw1.0/cal-ahb-c000000.wifi.bin")
+ 	case "$board" in
+-	gl.inet,gl-be3600)
++	gl.inet,gl-be3600|xiaomi,rd16)
+ 		# 0x11800 is the region ftm.conf allocates to this radio on the
+ 		# ap-mi04.1-c2 board (row "ap-mi04.1-c2,42,0,4096,71680,255"), ending
+ 		# exactly where the QCN6432 block starts (0x12800). Region-sized rather
+@@ -25,7 +25,7 @@ case "$FIRMWARE" in
+ 	;;
+ "ath12k/QCN6432/hw1.0/cal-ahb-soc@0:wifi-qcn6432.bin")
+ 	case "$board" in
+-	gl.inet,gl-be3600)
++	gl.inet,gl-be3600|xiaomi,rd16)
+ 		# QCN6432 (5 GHz) block: offset 0x12800 and region 0x1b800 straight from
+ 		# ftm.conf ("ap-mi04.1-c2,0053,1,75776,112640,0"). Region-sized for the
+ 		# same reason as above (the tested unit's block is 0x18800).
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/ieee80211/12-rd16-wifi b/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/ieee80211/12-rd16-wifi
+new file mode 100755
+index 0000000000..b3f77b3fcc
+--- /dev/null
++++ b/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/ieee80211/12-rd16-wifi
+@@ -0,0 +1,42 @@
++#!/bin/sh
++# Xiaomi RD16: fix up the radios 10-wifi-detect just generated.
++#
++# The Q6 firmware's own regulatory table (the radios are self-managed)
++# forbids EHT for RU, and caps 5170-5330 MHz at 80 MHz; channels 100-144
++# are not usable for RU clients either. wifi-detect picks EHT and "auto",
++# so the APs would fail with "Failed to set beacon parameters". Switch
++# RU radios to HE and pin 5 GHz to channel 36 (no DFS, starts at once).
++
++[ "$ACTION" = "add" ] || exit 0
++. /lib/functions.sh
++[ "$(board_name)" = "xiaomi,rd16" ] || exit 0
++
++# mac80211 lets the 5 GHz phy queue up to 16 MiB of frames (2.4 GHz: 4 MiB).
++# With ath12k's TX flow control the frames wait there, and 16 MiB is most of
++# what this board has free; use the 2.4 GHz default of 4 MiB for both.
++aqm="/sys/kernel/debug/ieee80211/$DEVICENAME/aqm"
++grep -q debugfs /proc/mounts || mount -t debugfs none /sys/kernel/debug 2>/dev/null
++for i in 1 2 3 4 5; do [ -w "$aqm" ] && break; sleep 1; done
++[ -w "$aqm" ] && echo "fq_memory_limit 4194304" > "$aqm"
++
++changed=
++fix_radio() {
++	local s="$1" country htmode band
++	config_get country "$s" country
++	config_get htmode "$s" htmode
++	config_get band "$s" band
++	[ "$country" = "RU" ] || return 0
++	case "$htmode" in EHT*) ;; *) return 0 ;; esac
++
++	uci set "wireless.$s.htmode=HE${htmode#EHT}"
++	[ "$band" = "5g" ] && uci set "wireless.$s.channel=36"
++	changed=1
++}
++
++config_load wireless
++config_foreach fix_radio wifi-device
++[ -n "$changed" ] || exit 0
++uci commit wireless
++ubus call network reload 2>/dev/null
++ubus call network.wireless retry 2>/dev/null
++exit 0
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/rd16-mem b/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/rd16-mem
+new file mode 100755
+index 0000000000..b96a9832d0
+--- /dev/null
++++ b/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/rd16-mem
+@@ -0,0 +1,12 @@
++#!/bin/sh /etc/rc.common
++# Xiaomi RD16: Linux only gets ~160 MiB of the 256 MiB (Q6/TZ carve-outs),
++# and ath12k pins most of it. The generic 16 MiB min_free_kbytes reserve
++# (meant for >128 MiB boards) then leaves almost nothing to userspace.
++
++START=12
++
++boot() {
++	case "$(board_name)" in
++	xiaomi,rd16) sysctl -qw vm.min_free_kbytes=8192 ;;
++	esac
++}
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/xiaomi-bootok b/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/xiaomi-bootok
+new file mode 100755
+index 0000000000..665064bd0b
+--- /dev/null
++++ b/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/xiaomi-bootok
+@@ -0,0 +1,26 @@
++#!/bin/sh /etc/rc.common
++# Xiaomi RD16: tell the stock U-Boot (bootmiwifi) that system slot A booted.
++# Stock firmware resets the boot-failure counter after every good boot; if
++# nobody does, U-Boot keeps counting flag_try_sys1_failed up and may fall back
++# to slot B (stock) on its own.
++
++START=99
++
++boot() {
++	case "$(board_name)" in
++	xiaomi,rd16) ;;
++	*) return 0 ;;
++	esac
++
++	command -v fw_printenv >/dev/null || return 0
++	[ "$(fw_printenv -n flag_boot_rootfs 2>/dev/null)" = "0" ] || return 0
++
++	[ "$(fw_printenv -n flag_try_sys1_failed 2>/dev/null)" = "0" ] &&
++	[ "$(fw_printenv -n flag_boot_success 2>/dev/null)" = "1" ] &&
++	[ "$(fw_printenv -n flag_last_success 2>/dev/null)" = "0" ] && return 0
++
++	fw_setenv flag_try_sys1_failed 0
++	fw_setenv flag_boot_success 1
++	fw_setenv flag_last_success 0
++	logger -t xiaomi-bootok "reset U-Boot slot A boot counter"
++}
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/lib/preinit/79_rd16_initramfs_nowifi b/target/linux/qualcommbe/ipq53xx/base-files/lib/preinit/79_rd16_initramfs_nowifi
+new file mode 100644
+index 0000000000..087f85df4c
+--- /dev/null
++++ b/target/linux/qualcommbe/ipq53xx/base-files/lib/preinit/79_rd16_initramfs_nowifi
+@@ -0,0 +1,15 @@
++# Xiaomi RD16: the RAM-boot (initramfs) image is the recovery/flashing tool.
++# Its rootfs already lives in RAM, and with ath12k loaded there is no room
++# left to download a factory.ubi into /tmp. Do not load Wi-Fi there.
++# (preinit_main stops at 70_initramfs_test, so hook the "initramfs" chain.)
++
++rd16_initramfs_nowifi() {
++	case "$(board_name)" in
++	xiaomi,rd16) ;;
++	*) return 0 ;;
++	esac
++
++	rm -f /etc/modules.d/ath12k /etc/modules.d/*ath12k*
++}
++
++boot_hook_add initramfs rd16_initramfs_nowifi
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/lib/preinit/81_rd16_rproc_coredump b/target/linux/qualcommbe/ipq53xx/base-files/lib/preinit/81_rd16_rproc_coredump
+new file mode 100644
+index 0000000000..80527b9065
+--- /dev/null
++++ b/target/linux/qualcommbe/ipq53xx/base-files/lib/preinit/81_rd16_rproc_coredump
+@@ -0,0 +1,17 @@
++# Xiaomi RD16 (256 MiB): never copy a Q6 WLAN firmware crash dump into RAM.
++# The remoteproc coredump of the Q6 regions (tens of MiB) runs the box out of
++# memory and panics it ("System is deadlocked on memory", seen on hardware).
++# Must happen before ath12k loads, so preinit rather than ieee80211 hotplug.
++
++rd16_rproc_coredump() {
++	case "$(board_name)" in
++	xiaomi,rd16) ;;
++	*) return 0 ;;
++	esac
++
++	for rproc in /sys/class/remoteproc/remoteproc*; do
++		[ -w "$rproc/coredump" ] && echo disabled > "$rproc/coredump"
++	done
++}
++
++boot_hook_add preinit_main rd16_rproc_coredump
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/lib/upgrade/platform.sh b/target/linux/qualcommbe/ipq53xx/base-files/lib/upgrade/platform.sh
+index 71a35a3e2a..60e81e0a57 100644
+--- a/target/linux/qualcommbe/ipq53xx/base-files/lib/upgrade/platform.sh
++++ b/target/linux/qualcommbe/ipq53xx/base-files/lib/upgrade/platform.sh
+@@ -1,5 +1,6 @@
+ REQUIRE_IMAGE_METADATA=1
+-RAMFS_COPY_BIN='dumpimage fitblk fit_check_sign'
++RAMFS_COPY_BIN='dumpimage fitblk fit_check_sign fw_printenv fw_setenv'
++RAMFS_COPY_DATA='/etc/fw_env.config'
+ 
+ gl_be6500_remove_oem_rootfs() {
+ 	local mtdnum
+@@ -43,6 +44,29 @@ gl_remove_oem_wifi_fw() {
+ 	}
+ }
+ 
++# Xiaomi RD16: the stock U-Boot (bootmiwifi) boots system slot A ("rootfs",
++# the one OpenWrt lives in) while flag_boot_rootfs=0 and counts failed boots
++# in flag_try_sys1_failed. Point it at slot A with a clean counter before
++# rewriting it; slot B ("rootfs_1", stock firmware) is never touched and
++# stays the fallback if the new image does not boot.
++xiaomi_rd16_set_boot_slot_a() {
++	local script=/tmp/rd16-uboot-env
++
++	[ -s /etc/fw_env.config ] || {
++		echo "no /etc/fw_env.config, leaving the U-Boot boot flags alone"
++		return 0
++	}
++	mkdir -p /var/lock
++	: > "$script"
++	[ "$(fw_printenv -n flag_boot_rootfs 2>/dev/null)" = 0 ] ||
++		echo "flag_boot_rootfs 0" >> "$script"
++	[ "$(fw_printenv -n flag_try_sys1_failed 2>/dev/null)" = 0 ] ||
++		echo "flag_try_sys1_failed 0" >> "$script"
++	# one env write (one erase of 0:appsblenv) for all changes, if any
++	[ -s "$script" ] && fw_setenv -s "$script"
++	return 0
++}
++
+ platform_do_upgrade() {
+ 	case "$(board_name)" in
+ 	gl.inet,gl-be3600)
+@@ -65,6 +89,12 @@ platform_do_upgrade() {
+ 		CI_KERNPART="kernel0"
+ 		fit_do_upgrade "$1"
+ 		;;
++	xiaomi,rd16)
++		xiaomi_rd16_set_boot_slot_a
++		# slot A only: UBI volumes kernel / rootfs / rootfs_data on "rootfs"
++		CI_UBIPART="rootfs"
++		nand_do_upgrade "$1"
++		;;
+ 	*)
+ 		echo "Sysupgrade is not supported on your board yet."
+ 		return 1
+@@ -107,6 +137,24 @@ platform_check_image() {
+ 	ubnt,u7-pro-xgs)
+ 		fit_check_image "$1"
+ 		;;
++	xiaomi,rd16)
++		# nand_do_platform_check also accepts a bare FIT or UBI image. A FIT
++		# (the initramfs .itb) would be written into the kernel volume only,
++		# and factory.ubi is meant for the TFTP/ubiformat path, so take the
++		# sysupgrade tar only.
++		case "$(get_magic_long "$1")" in
++		d00dfeed)
++			echo "This is a FIT (initramfs) image, use *-squashfs-sysupgrade.bin"
++			return 1
++			;;
++		55424923)
++			echo "This is factory.ubi, use *-squashfs-sysupgrade.bin"
++			echo "(or ubiformat /dev/mtd19 from the TFTP RAM-boot image)"
++			return 1
++			;;
++		esac
++		nand_do_platform_check "xiaomi_rd16" "$1"
++		;;
+ 	*)
+ 		echo "Sysupgrade is not supported on your board yet."
+ 		return 1
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/usr/libexec/platform/packet-steering.sh b/target/linux/qualcommbe/ipq53xx/base-files/usr/libexec/platform/packet-steering.sh
+index 05bad94878..cccbc3c3ad 100755
+--- a/target/linux/qualcommbe/ipq53xx/base-files/usr/libexec/platform/packet-steering.sh
++++ b/target/linux/qualcommbe/ipq53xx/base-files/usr/libexec/platform/packet-steering.sh
+@@ -28,4 +28,34 @@ for dev in /sys/class/net/*; do
+ 	esac
+ done
+ 
++# Xiaomi RD16: the YT9215S hangs off one PPE port and all of its traffic
++# arrives on a single EDMA Rx ring (rxdesc_12, CPU0), so the assumption
++# above does not hold there: CPU0 saturated at ~500 Mbit/s of Wi-Fi.
++# Spread the PPE backlog over CPU1-3 and move the two busiest Wi-Fi
++# interrupts off CPU0/CPU3 (measured on hardware).
++. /lib/functions.sh
++[ "$(board_name)" = "xiaomi,rd16" ] || exit 0
++[ "$1" = "0" ] && exit 0
++
++for dev in /sys/class/net/*; do
++	[ -d "$dev/device" ] || continue
++	case "$(basename "$(readlink -f "$dev/device")")" in
++	*.ethernet)
++		for q in "$dev"/queues/rx-*; do
++			[ -f "$q/rps_cpus" ] || continue
++			echo e > "$q/rps_cpus"
++			echo 4096 > "$q/rps_flow_cnt"
++		done
++		;;
++	esac
++done
++echo 16384 > /proc/sys/net/core/rps_sock_flow_entries
++
++# QCN6432 DP group 2 (TX completions ring 2, monitor, REO status, RX refill)
++irq=$(awk '$6 ~ /wifi-qcn6432/ && $7 == 8 && $NF == "DP_EXT_IRQ" { sub(":", "", $1); print $1 }' /proc/interrupts)
++[ -n "$irq" ] && echo 1 > /proc/irq/$irq/smp_affinity_list
++# IPQ5332 (2.4 GHz) monitor destination ring
++irq=$(awk '$NF == "rxdma2host-monitor-destination-mac1" { sub(":", "", $1); print $1 }' /proc/interrupts)
++[ -n "$irq" ] && echo 3 > /proc/irq/$irq/smp_affinity_list
++
+ exit 0
+-- 
+2.43.0
+

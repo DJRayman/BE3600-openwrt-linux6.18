@@ -1,0 +1,9 @@
+# OpenWrt tree cloned by build.sh
+/openwrt/
+# build output
+/out/
+# stock firmware dumps and extracted Qualcomm/Xiaomi binaries: never commit
+/stock/
+*.bin
+*.ubi
+*.itb
