@@ -60,6 +60,55 @@ OpenWrt ставится в **системный слот A**. В слоте B �
 
 ## Установка
 
+OpenWrt всегда ставится в **слот A** (раздел `rootfs`), а заводская прошивка должна остаться
+в **слоте B** (`rootfs_1`). Какой слот активен, показывает `flag_boot_rootfs` в окружении U-Boot:
+`0` — A, `1` — B.
+
+### Способ 1: с заводской прошивки по SSH, без UART
+
+> Этот способ повторяет механизм обновления самой Xiaomi и скрипты
+> [RomikB/xiaomi-be3600-overlay](https://github.com/RomikB/xiaomi-be3600-overlay).
+> Автор этого проекта его не проверял, проверен только способ 2.
+
+Нужен root‑доступ по SSH к заводской прошивке. Как его получить, здесь не описано:
+overlay RomikB рассчитан на то, что доступ уже есть.
+
+1. **Проверьте слот.** Заводская прошивка должна работать из слота B:
+   ```
+   nvram get flag_boot_rootfs        # должно быть 1
+   ```
+   Если выводит `0`, заводская прошивка сейчас в слоте A, и записывать OpenWrt нельзя:
+   слот A затрёт работающую систему. Сначала обновите заводскую прошивку через веб‑интерфейс
+   Xiaomi. Она запишется в другой слот и загрузится оттуда, после этого должно стать `1`.
+2. **Сохраните ART** (калибровка Wi‑Fi) и перенесите файл на ПК:
+   ```
+   grep '"0:art"' /proc/mtd                         # номер раздела N
+   dd if=/dev/mtdN of=/tmp/art.bin
+   ```
+3. **Скопируйте образ** `…-squashfs-factory.ubi` на роутер как `/tmp/root.ubi`
+   (scp/sftp; в overlay RomikB есть `openssh-sftp-server`).
+4. **Запишите слот A и переключитесь на него.**
+   Со скриптами overlay RomikB (из `/data/scripts`):
+   ```
+   cd /tmp && sh /data/scripts/upgrade_other_rootfs.sh && sh /data/scripts/reboot_other_rootfs.sh
+   ```
+   Без них то же самое вручную:
+   ```
+   ubiformat /dev/mtd$(grep '"rootfs"' /proc/mtd | cut -d: -f1 | tr -dc 0-9) -f /tmp/root.ubi -s 2048 -O 2048 -y
+   nvram set flag_boot_rootfs=0; nvram set flag_last_success=0; nvram set flag_try_sys1_failed=0
+   nvram commit; reboot
+   ```
+5. Если OpenWrt не загрузится, U-Boot после нескольких неудачных попыток сам вернётся
+   на заводскую прошивку в слоте B.
+
+**С прошивки RomikB** (`openwrt-24-rd15`): его sysupgrade принимает UBI‑образ и пишет его
+в **активный** слот. Если его OpenWrt работает из слота A (`nvram get flag_boot_rootfs` → `0`),
+установите наш `…-squashfs-factory.ubi` через LuCI **без сохранения настроек**: конфиги
+несовместимы (swconfig и qca‑wifi против DSA и mac80211). Если его прошивка в слоте B,
+так делать нельзя: наша сборка рассчитана только на слот A.
+
+### Способ 2: через UART и TFTP
+
 Нужны UART, TFTP‑сервер на ПК (адрес 192.168.31.100) и кабель в любой LAN‑порт.
 U-Boot роутера использует адрес 192.168.31.1.
 
@@ -101,7 +150,9 @@ sysupgrade -v /tmp/openwrt-qualcommbe-ipq53xx-xiaomi_rd16-squashfs-sysupgrade.bi
 
 ### Возврат на заводскую прошивку
 
-В U-Boot: `setenv flag_boot_rootfs 1; saveenv; reset`. Слот B при этом не меняется.
+Из OpenWrt: `fw_setenv flag_boot_rootfs 1; reboot`, или из U-Boot: `setenv flag_boot_rootfs 1; saveenv; reset`.
+Слот B при этом не меняется, а OpenWrt в слоте A остаётся. Вернуться в OpenWrt можно с заводской прошивки
+(`nvram set flag_boot_rootfs=0; nvram commit; reboot`) или из U-Boot.
 
 ## Сборка
 
@@ -121,19 +172,31 @@ pipx install ubi_reader
 
 ### Прошивка Wi‑Fi из заводского образа
 
-Прошивка Q6, данные платы (`bdwlan`) и калибровка — это бинарные файлы Qualcomm и Xiaomi.
-Они **не входят в репозиторий** и берутся из заводской системы вашего же роутера (слот B):
-```
-./scripts/extract-stock.sh rootfs_1.bin          # -> stock/rootfs/lib/firmware
-```
-Прошивка из других источников, например от GL.iNet для 1 ГБ ОЗУ, на RD16 падает:
+Прошивка Q6 и данные платы (`bdwlan`) — это бинарные файлы Qualcomm и Xiaomi, поэтому они
+**не входят в репозиторий**. Калибровку роутер читает сам, из своего раздела ART.
+Взять прошивку можно из одного из двух источников:
+
+- **заводской системы своего роутера** (дамп слота B, см. «Установка», способ 2, шаг 2):
+  ```
+  ./scripts/extract-stock.sh rootfs_1.bin
+  ```
+- **официального файла прошивки Xiaomi для RD16** (`miwifi_rd16_firmware_*.bin`): дамп не нужен,
+  ubi_reader сам находит UBI‑образ внутри контейнера Xiaomi (HDR1):
+  ```
+  ./scripts/extract-stock.sh miwifi_rd16_firmware_XXXX.bin
+  ```
+
+В обоих случаях результат будет в `stock/rootfs/lib/firmware`, и скрипт напишет версию
+прошивки Q6. Порт проверен с `WLAN.WBE.1.3.r4-00038`. С другой версией скрипт предупредит:
+она может потребовать других областей памяти или параметров загрузки Q6.
+Прошивка для других устройств, например GL.iNet для 1 ГБ ОЗУ, на RD16 падает:
 она рассчитана на другой режим памяти.
 
 ### Быстрый старт
 
 ```
 git clone <этот репозиторий> openwrt-xiaomi-rd16 && cd openwrt-xiaomi-rd16
-./scripts/extract-stock.sh /путь/к/rootfs_1.bin
+./scripts/extract-stock.sh /путь/к/rootfs_1.bin   # или miwifi_rd16_firmware_*.bin
 bash build.sh                      # оба варианта; только один: VARIANTS=base bash build.sh
 ```
 Скрипт сам клонирует дерево OpenWrt в `./openwrt` на нужном коммите, накладывает патчи,
@@ -162,7 +225,7 @@ bash build.sh                      # оба варианта; только од�
 build.sh                  подготовка дерева, фиды, overlay, сборка вариантов
 configs/                  xiaomi_rd16.config (base), xiaomi_rd16-podkop.config (добавка)
 patches/                  серия для git am поверх fivefold3/openwrt-gl-be3600 @ e46ea77
-scripts/extract-stock.sh  lib/firmware из дампа слота B
+scripts/extract-stock.sh  lib/firmware из дампа слота B или из прошивки Xiaomi (.bin)
 scripts/stock-wifi-fw.py  заводская прошивка Q6 + board-2.bin -> files/lib/firmware
 scripts/luci-wan-first.py порт WAN первым в строке портов LuCI (как на корпусе)
 scripts/podkop-fixups.sh  правки фида podkop (зависимость sing-box, версия для apk, кэш версии)
