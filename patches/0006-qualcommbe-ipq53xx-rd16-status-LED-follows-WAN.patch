@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
+Date: Mon, 19 Oct 2026 22:20:04 +0300
+Subject: [PATCH] qualcommbe: ipq53xx: rd16: status LED follows WAN like stock
+
+After boot diag.sh just left the blue LED on. Do what the stock firmware
+does: blue while the wan interface is up, orange while it is down. An
+iface hotplug script switches the LEDs on ifup/ifdown of wan, and
+/etc/init.d/rd16-leds (S96, after diag.sh "done") sets the state once
+at boot. Boot, failsafe and upgrade blinking are unchanged. An LED
+set up in LuCI (a system.led section on blue/orange:status) is left
+alone.
+---
+ .../etc/hotplug.d/iface/50-rd16-leds          | 22 +++++++++++++++++++
+ .../ipq53xx/base-files/etc/init.d/rd16-leds   | 13 +++++++++++
+ 2 files changed, 35 insertions(+)
+ create mode 100755 target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/iface/50-rd16-leds
+ create mode 100755 target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/rd16-leds
+
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/iface/50-rd16-leds b/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/iface/50-rd16-leds
+new file mode 100755
+index 0000000000..704f2053af
+--- /dev/null
++++ b/target/linux/qualcommbe/ipq53xx/base-files/etc/hotplug.d/iface/50-rd16-leds
+@@ -0,0 +1,22 @@
++#!/bin/sh
++# Xiaomi RD16: status LED as on the stock firmware: blue while WAN is up,
++# orange while it is down. /etc/init.d/rd16-leds runs this at boot too.
++# An LED set up in LuCI (a system.led section) is left alone.
++
++[ "$INTERFACE" = "wan" ] || exit 0
++case "$ACTION" in
++ifup|ifdown) ;;
++*) exit 0 ;;
++esac
++. /lib/functions.sh
++[ "$(board_name)" = "xiaomi,rd16" ] || exit 0
++uci -q show system | grep -q "\.sysfs='[a-z]*:status'" && exit 0
++
++. /lib/functions/leds.sh
++if [ "$ACTION" = "ifup" ]; then
++	led_off orange:status
++	led_on blue:status
++else
++	led_off blue:status
++	led_on orange:status
++fi
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/rd16-leds b/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/rd16-leds
+new file mode 100755
+index 0000000000..75b12b1493
+--- /dev/null
++++ b/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/rd16-leds
+@@ -0,0 +1,13 @@
++#!/bin/sh /etc/rc.common
++# Xiaomi RD16: set the status LED from the WAN state once the boot is done
++# (diag.sh leaves it blue); later changes come from the iface hotplug.
++
++START=96
++
++boot() {
++	local ACTION=ifdown INTERFACE=wan
++
++	[ "$(ifstatus wan 2>/dev/null | jsonfilter -e '@.up')" = "true" ] &&
++		ACTION=ifup
++	( . /etc/hotplug.d/iface/50-rd16-leds )
++}
+-- 
+2.47.3
+
