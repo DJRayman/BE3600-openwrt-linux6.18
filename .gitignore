@@ -7,3 +7,5 @@
 *.bin
 *.ubi
 *.itb
+# stray copies from the Windows drive
+/mnt/
