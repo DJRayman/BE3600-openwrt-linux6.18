@@ -14,6 +14,8 @@
 #   OUT_DIR      where the images go; default ./out
 #   JOBS         parallel make jobs; default: number of CPUs
 #   KEEP_TREE=1  do not reset the OpenWrt tree to BASE + patches
+#   DSA_TAGGING  switch tagging on first boot: native (default) or 8021q;
+#                a mode chosen later with yt921x-tagging is kept
 set -euo pipefail
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,6 +38,7 @@ STOCK_FW="${STOCK_FW:-$PROJECT/stock/rootfs/lib/firmware}"
 OUT="${OUT_DIR:-$PROJECT/out}"
 JOBS="${JOBS:-$(nproc)}"
 VARIANTS="${VARIANTS:-base podkop}"
+DSA_TAGGING="${DSA_TAGGING:-native}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -53,6 +56,7 @@ fi
 for v in $VARIANTS; do
 	case "$v" in base|podkop) ;; *) die "unknown variant '$v' (base, podkop)" ;; esac
 done
+case "$DSA_TAGGING" in native|8021q) ;; *) die "unknown DSA_TAGGING '$DSA_TAGGING' (native, 8021q)" ;; esac
 
 # --- OpenWrt tree --------------------------------------------------------
 if [ ! -d "$SRC/.git" ]; then
@@ -91,6 +95,20 @@ sh "$PROJECT/scripts/podkop-fixups.sh" "$SRC" "${PODKOP_TAG#v}"
 log "stock Wi-Fi firmware -> files/lib/firmware"
 python3 "$PROJECT/scripts/stock-wifi-fw.py" "$STOCK_FW" files/lib/firmware
 python3 "$PROJECT/scripts/luci-wan-first.py" feeds/luci files
+DEFAULTS=files/etc/uci-defaults/99-rd16-dsa-tagging
+if [ "$DSA_TAGGING" = native ]; then
+	rm -f "$DEFAULTS"
+else
+	log "switch tagging on first boot: $DSA_TAGGING"
+	mkdir -p "${DEFAULTS%/*}"
+	# only when unset, so sysupgrade keeps a mode chosen with yt921x-tagging
+	cat > "$DEFAULTS" <<-EOT
+	uci -q get network.globals.dsa_tagging >/dev/null && exit 0
+	uci -q get network.globals >/dev/null || uci set network.globals=globals
+	uci set network.globals.dsa_tagging=$DSA_TAGGING
+	uci commit network
+	EOT
+fi
 
 # --- build ---------------------------------------------------------------
 TGT=bin/targets/qualcommbe/ipq53xx
