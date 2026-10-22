@@ -1,4 +1,4 @@
-From a3d8eae0b12a39a1144c48d9cd72c0bffa7a80c5 Mon Sep 17 00:00:00 2001
+From c2ae8e54df48086be9a9150bfd3026fa96cff864 Mon Sep 17 00:00:00 2001
 From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
 Date: Thu, 22 Oct 2026 17:21:12 +0000
 Subject: [PATCH] qualcommbe: ipq53xx: yt921x: optional 802.1Q tagging
@@ -9,53 +9,98 @@ Subject: [PATCH] qualcommbe: ipq53xx: yt921x: optional 802.1Q tagging
   from the RomikB/openwrt openwrt-24-rd15 driver; bridged ports still
   switch in hardware;
 - native tagging stays the default; /usr/sbin/yt921x-tagging switches
-  at runtime (status | native | 8021q) for A/B measurements.
+  at runtime (status | native | 8021q) for A/B measurements and saves
+  the choice in network.globals.dsa_tagging; /etc/init.d/yt921x-tagging
+  applies it at boot, before netifd.
 
 This is the first step towards PPE flow offload: the PPE can only map
 switch ports it can classify, and it classifies by VLAN.
 ---
- .../base-files/usr/sbin/yt921x-tagging        |  31 +
+ .../base-files/etc/init.d/yt921x-tagging      |   8 +
+ .../base-files/usr/sbin/yt921x-tagging        |  58 ++
  .../linux/qualcommbe/ipq53xx/config-default   |   1 +
  ...-dsa-yt921x-add-802.1Q-based-tagging.patch | 883 ++++++++++++++++++
- 3 files changed, 915 insertions(+)
+ 4 files changed, 950 insertions(+)
+ create mode 100755 target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/yt921x-tagging
  create mode 100755 target/linux/qualcommbe/ipq53xx/base-files/usr/sbin/yt921x-tagging
  create mode 100644 target/linux/qualcommbe/patches-6.18/9114-net-dsa-yt921x-add-802.1Q-based-tagging.patch
 
+diff --git a/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/yt921x-tagging b/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/yt921x-tagging
+new file mode 100755
+index 0000000..5fd2132
+--- /dev/null
++++ b/target/linux/qualcommbe/ipq53xx/base-files/etc/init.d/yt921x-tagging
+@@ -0,0 +1,8 @@
++#!/bin/sh /etc/rc.common
++# Apply the switch tagging saved by yt921x-tagging before netifd starts.
++
++START=19
++
++boot() {
++	[ -x /usr/sbin/yt921x-tagging ] && /usr/sbin/yt921x-tagging boot
++}
 diff --git a/target/linux/qualcommbe/ipq53xx/base-files/usr/sbin/yt921x-tagging b/target/linux/qualcommbe/ipq53xx/base-files/usr/sbin/yt921x-tagging
 new file mode 100755
-index 0000000..4902912
+index 0000000..69b66ad
 --- /dev/null
 +++ b/target/linux/qualcommbe/ipq53xx/base-files/usr/sbin/yt921x-tagging
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,58 @@
 +#!/bin/sh
 +# Show or switch the DSA tagging of the YT9215S switch:
 +#   native  Motorcomm 0x9988 header (default)
 +#   8021q   802.1Q VLANs 4001+ / 4017+ per port
 +# Switching takes the wired network down for a few seconds; run it from
-+# Wi-Fi or the serial console. The choice lasts until the next reboot.
++# Wi-Fi or the serial console. The choice is saved in network.globals.dsa_tagging
++# and applied again at boot by /etc/init.d/yt921x-tagging.
 +
 +CONDUIT=eth0
 +TAGGING=/sys/class/net/$CONDUIT/dsa/tagging
 +
 +[ -w "$TAGGING" ] || { echo "no DSA switch behind $CONDUIT" >&2; exit 1; }
 +
++set_tagging() {
++	for upper in /sys/class/net/$CONDUIT/upper_*; do
++		[ -e "$upper" ] && ip link set "${upper##*/upper_}" down
++	done
++	ip link set "$CONDUIT" down
++	echo "$1" > "$TAGGING" || echo "failed to switch to $1" >&2
++}
++
++proto_of() {
++	case "$1" in
++	native) echo yt921x ;;
++	8021q) echo yt921x-8021q ;;
++	esac
++}
++
 +case "$1" in
-+""|status) cat "$TAGGING"; exit 0 ;;
-+native) proto=yt921x ;;
-+8021q) proto=yt921x-8021q ;;
-+*) echo "usage: ${0##*/} [status|native|8021q]" >&2; exit 1 ;;
++""|status)
++	cat "$TAGGING"
++	exit 0
++	;;
++boot)
++	# before netifd starts: nothing to stop or restart
++	proto=$(proto_of "$(uci -q get network.globals.dsa_tagging)")
++	[ -n "$proto" ] && [ "$(cat "$TAGGING")" != "$proto" ] && set_tagging "$proto"
++	exit 0
++	;;
++native|8021q)
++	proto=$(proto_of "$1")
++	;;
++*)
++	echo "usage: ${0##*/} [status|native|8021q]" >&2
++	exit 1
++	;;
 +esac
++
++uci -q get network.globals >/dev/null || uci set network.globals=globals
++uci set network.globals.dsa_tagging="$1"
++uci commit network
 +
 +[ "$(cat "$TAGGING")" = "$proto" ] && exit 0
 +
 +/etc/init.d/network stop
-+for upper in /sys/class/net/$CONDUIT/upper_*; do
-+	[ -e "$upper" ] && ip link set "${upper##*/upper_}" down
-+done
-+ip link set "$CONDUIT" down
-+
-+echo "$proto" > "$TAGGING" || echo "failed to switch to $proto" >&2
-+
++set_tagging "$proto"
 +/etc/init.d/network start
 +cat "$TAGGING"
 diff --git a/target/linux/qualcommbe/ipq53xx/config-default b/target/linux/qualcommbe/ipq53xx/config-default
