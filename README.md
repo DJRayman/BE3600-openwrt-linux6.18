@@ -41,7 +41,7 @@ OpenWrt ставится в **системный слот A**. В слоте B �
 | Кнопка reset | ⚠️ короткое нажатие — перезагрузка, ≥5 с — сброс настроек (стандарт OpenWrt); на железе не проверено |
 | Кнопка mesh | ✅ включает/выключает оба радио Wi‑Fi |
 | Светодиоды | ✅ как в стоке: синий — WAN поднят, оранжевый — WAN нет; мигают при загрузке, failsafe и обновлении |
-| Аппаратное ускорение NSS/PPE (NAT, Wi‑Fi offload) | ❌ трафик обрабатывает CPU |
+| Аппаратное ускорение NSS/PPE (NAT, Wi‑Fi offload) | 🧪 прототип: IPv4 NAT в PPE (патч 0008, не проверен на железе); Wi‑Fi — CPU |
 
 ## Варианты прошивки
 
@@ -243,6 +243,7 @@ scripts/podkop-fixups.sh  правки фида podkop (зависимость s
 | 0005 | Кнопка mesh включает и выключает Wi‑Fi (`KEY_RFKILL`, обработчик `/etc/rc.button/rfkill`) |
 | 0006 | Светодиод статуса как в стоке: синий — WAN поднят, оранжевый — WAN нет (`/etc/hotplug.d/iface/50-rd16-leds`, `/etc/init.d/rd16-leds`) |
 | 0007 | Коммутатор: необязательное тегирование 802.1Q вместо заголовка `0x9988` (тег-драйвер `yt921x-8021q`, скрипт `yt921x-tagging`) |
+| 0008 | PPE: аппаратный offload IPv4‑потоков из flowtable (NAT TCP/UDP), экспериментально, нужен режим 802.1Q |
 
 ### Тегирование 802.1Q на коммутаторе (экспериментально)
 
@@ -274,6 +275,40 @@ yt921x-tagging native   # вернуть заголовок 0x9988
 ПК в LAN, в каждом режиме, вместе с загрузкой CPU (`top`, `mpstat -P ALL 1`).
 Если что‑то не работает, пришлите `dmesg | grep -i yt921x` и `ethtool -S lan1`.
 
+### Аппаратный offload NAT в PPE (экспериментально)
+
+Патч 0008 учит драйвер `qcom-ppe` принимать потоки из netfilter flowtable (`flow_offloading_hw`)
+и прописывать их в таблицы PPE: поток, хост источника и nexthop (MAC, VLAN порта свитча,
+адрес и порт NAT). Дальше пакеты такого потока PPE пересылает сам, минуя CPU. Новые
+соединения, фрагменты и TCP SYN/FIN/RST по‑прежнему идут через CPU.
+
+Что поддерживается: IPv4 TCP и UDP, SNAT/DNAT/маршрутизация между портами свитча
+(в режиме 802.1Q) и портами EDMA. Не поддерживаются: IPv6, PPPoE, WAN в VLAN, Wi‑Fi,
+мосты с VLAN‑фильтрацией. Такие потоки остаются на программном offload.
+
+Код написан по исходникам `qca-ssdk` и `nss-ppe` и на железе ещё не проверялся.
+
+Включение (нужен режим 802.1Q из предыдущего раздела):
+
+```
+yt921x-tagging 8021q
+uci set firewall.@defaults[0].flow_offloading=1
+uci set firewall.@defaults[0].flow_offloading_hw=1
+uci commit firewall && service firewall restart
+```
+
+Проверка: запустите `iperf3` через NAT и смотрите
+`cat /sys/kernel/debug/ppe/flow` — там регистры, MAC, хосты, nexthop и потоки
+со счётчиками пакетов. Если счётчики растут, а загрузка CPU падает, offload работает.
+`nft list flowtables` и `conntrack -L | grep HW_OFFLOAD` показывают, что ядро отдало поток в PPE.
+
+Если трафик пропадает, выключите `flow_offloading_hw` и пришлите `dmesg | grep -i ppe`
+и вывод `/sys/kernel/debug/ppe/flow`. Параметры для экспериментов
+(`/etc/modules.d/qcom-ppe`, строка `qcom-ppe host_redirect=0`, затем перезагрузка):
+
+- `host_redirect=1|0` — что делать пакетам, попавшим в хост‑запись источника: отправлять в CPU (по умолчанию) или пересылать;
+- `tcp_special_bypass=1|0` — отправлять TCP SYN/FIN/RST потоков в CPU (по умолчанию да).
+
 ### Параметры ath12k
 
 `/etc/modules.d/ath12k`, например `ath12k rx_mon_status=1`:
@@ -295,7 +330,7 @@ yt921x-tagging native   # вернуть заголовок 0x9988
 | Пользовательское пространство | 32‑бит ARM (`cortex-a7`), как в заводской прошивке | 64‑бит `aarch64` |
 | Wi‑Fi | проприетарный `qca-wifi` из заводской прошивки (cnss‑daemon, cfg80211tool, vendor hostapd/wpa_supplicant) | открытый ath12k, hostapd OpenWrt; из заводской прошивки взята только прошивка Q6 |
 | Коммутатор | вендорский драйвер `yt-9215s` + swconfig | DSA `yt921x` из ядра (Linux 6.19) |
-| Ускорение | NSS PPE/ECM (аппаратный NAT, ускорение Wi‑Fi) | нет: CPU, RPS, программный flow offload |
+| Ускорение | NSS PPE/ECM (аппаратный NAT, ускорение Wi‑Fi) | CPU, RPS, программный flow offload; прототип аппаратного IPv4 NAT в PPE |
 | Wi‑Fi‑функции | полный набор QSDK | HE80 на 5 ГГц; DFS и 160 МГц не работают |
 | Откуда бинарники | генерируются из `miwifi_rd16_firmware_*.bin` (`vendor_scripts/`) | только прошивка Q6 и board data из дампа слота B |
 | Слоты A/B, sysupgrade | ✅ | ✅ (только слот A, B — заводской) |
