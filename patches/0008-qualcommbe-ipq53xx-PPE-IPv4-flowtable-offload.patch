@@ -1,4 +1,4 @@
-From a1ea8e7be5ddd136d9803ace8a35ab7811dc49a2 Mon Sep 17 00:00:00 2001
+From 722daf46aa51d7c3db5c087b9585d524edb49f7f Mon Sep 17 00:00:00 2001
 From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
 Date: Thu, 22 Oct 2026 19:55:18 +0000
 Subject: [PATCH] qualcommbe: ipq53xx: PPE IPv4 flowtable offload
@@ -15,8 +15,8 @@ firewall flow_offloading_hw is enabled. State and counters are in
 /sys/kernel/debug/ppe/flow.
 ---
  .../linux/qualcommbe/ipq53xx/config-default   |    1 +
- ...lcomm-ppe-add-IPv4-flowtable-offload.patch | 1816 +++++++++++++++++
- 2 files changed, 1817 insertions(+)
+ ...lcomm-ppe-add-IPv4-flowtable-offload.patch | 1879 +++++++++++++++++
+ 2 files changed, 1880 insertions(+)
  create mode 100644 target/linux/qualcommbe/patches-6.18/9115-net-ethernet-qualcomm-ppe-add-IPv4-flowtable-offload.patch
 
 diff --git a/target/linux/qualcommbe/ipq53xx/config-default b/target/linux/qualcommbe/ipq53xx/config-default
@@ -33,11 +33,11 @@ index 258f94b..16e8c63 100644
  CONFIG_QCOM_SPMI_ADC5=y
 diff --git a/target/linux/qualcommbe/patches-6.18/9115-net-ethernet-qualcomm-ppe-add-IPv4-flowtable-offload.patch b/target/linux/qualcommbe/patches-6.18/9115-net-ethernet-qualcomm-ppe-add-IPv4-flowtable-offload.patch
 new file mode 100644
-index 0000000..201dd01
+index 0000000..b378ae5
 --- /dev/null
 +++ b/target/linux/qualcommbe/patches-6.18/9115-net-ethernet-qualcomm-ppe-add-IPv4-flowtable-offload.patch
-@@ -0,0 +1,1816 @@
-+From 15d46e4605ed0d7c7506d83b93db431629c3f669 Mon Sep 17 00:00:00 2001
+@@ -0,0 +1,1879 @@
++From d0d48963a0ed2848193cee962c637b97dab62988 Mon Sep 17 00:00:00 2001
 +From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
 +Date: Thu, 22 Oct 2026 19:54:55 +0000
 +Subject: [PATCH] net: ethernet: qualcomm: ppe: add IPv4 flowtable offload
@@ -61,10 +61,10 @@ index 0000000..201dd01
 + drivers/net/ethernet/qualcomm/ppe/edma_port.c |   17 +
 + drivers/net/ethernet/qualcomm/ppe/edma_port.h |    1 +
 + drivers/net/ethernet/qualcomm/ppe/ppe.c       |    7 +
-+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.c  | 1447 +++++++++++++++++
++ drivers/net/ethernet/qualcomm/ppe/ppe_flow.c  | 1494 +++++++++++++++++
 + drivers/net/ethernet/qualcomm/ppe/ppe_flow.h  |   37 +
-+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h  |  160 ++
-+ 8 files changed, 1682 insertions(+)
++ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h  |  176 ++
++ 8 files changed, 1745 insertions(+)
 + create mode 100644 drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 + create mode 100644 drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
 +
@@ -190,10 +190,10 @@ index 0000000..201dd01
 + 	edma_destroy(ppe_dev);
 +diff --git a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
 +new file mode 100644
-+index 000000000..4f4bf6442
++index 000000000..79ec279dc
 +--- /dev/null
 ++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
-+@@ -0,0 +1,1447 @@
++@@ -0,0 +1,1494 @@
 ++// SPDX-License-Identifier: GPL-2.0-only
 ++/*
 ++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
@@ -265,15 +265,15 @@ index 0000000..201dd01
 ++#define PPE_FLOW_NEXTHOP_WORDS		4
 ++#define PPE_FLOW_OP_TIMEOUT_US		1000
 ++
-++static bool host_redirect = true;
+++static bool host_redirect;
 ++module_param(host_redirect, bool, 0644);
 ++MODULE_PARM_DESC(host_redirect,
-++		 "Redirect host route hits of flow source addresses to the CPU (default: true)");
+++		 "Redirect host route hits of flow source addresses to the CPU (default: false)");
 ++
-++static bool tcp_special_bypass = true;
+++static bool tcp_special_bypass;
 ++module_param(tcp_special_bypass, bool, 0644);
 ++MODULE_PARM_DESC(tcp_special_bypass,
-++		 "Send TCP SYN, FIN and RST of offloaded flows to the CPU (default: true)");
+++		 "Bypass the flow table for TCP control segments instead of using TCP flag exceptions (default: false)");
 ++
 ++struct ppe_flow_host {
 ++	struct list_head list;
@@ -1320,6 +1320,49 @@ index 0000000..201dd01
 ++
 ++	for_each_set_bit(port, &flow->in_ports, BITS_PER_LONG)
 ++		ppe_flow_in_port_disable(flow, port);
+++
+++	/* Apply changed module parameters with the next flow. */
+++	flow->hw_ready = false;
+++}
+++
+++/* Send TCP FIN, SYN and RST segments of offloaded flows to the CPU, so that
+++ * conntrack sees the connection close, through the TCP_FLAGS_0..2 exceptions
+++ * as the vendor driver does.
+++ */
+++static int ppe_flow_tcp_excep_init(struct ppe_flow *flow)
+++{
+++	static const u8 tcp_flags[] = { 0x01, 0x02, 0x04 };
+++	struct regmap *regmap = flow->ppe_dev->regmap;
+++	u32 addr, exp;
+++	int ret, i;
+++
+++	for (i = 0; i < ARRAY_SIZE(tcp_flags); i++) {
+++		addr = PPE_L4_EXCEP_PARSER_CTRL_ADDR +
+++		       PPE_L4_EXCEP_PARSER_CTRL_INC * (i / 2);
+++		ret = regmap_update_bits(regmap, addr,
+++					 PPE_L4_EXCEP_PARSER_FLAGS(i) |
+++					 PPE_L4_EXCEP_PARSER_MASK(i),
+++					 (tcp_flags[i] << __ffs(PPE_L4_EXCEP_PARSER_FLAGS(i))) |
+++					 (tcp_flags[i] << __ffs(PPE_L4_EXCEP_PARSER_MASK(i))));
+++		if (ret)
+++			return ret;
+++
+++		exp = PPE_L3_EXCEP_TCP_FLAGS(i);
+++		ret = regmap_write(regmap, PPE_L3_EXCEP_CMD_ADDR +
+++				   PPE_L3_EXCEP_CMD_INC * exp,
+++				   FIELD_PREP(PPE_L3_EXCEP_CMD_CMD,
+++					      PPE_FLOW_ACTION_REDIRECT_TO_CPU));
+++		if (ret)
+++			return ret;
+++
+++		ret = regmap_write(regmap, PPE_L3_FLOW_HIT_EXCEP_CTRL_ADDR +
+++				   PPE_L3_FLOW_HIT_EXCEP_CTRL_INC * exp,
+++				   PPE_L3_FLOW_HIT_EXCEP_CTRL_EN);
+++		if (ret)
+++			return ret;
+++	}
+++
+++	return 0;
 ++}
 ++
 ++/* Global L3 settings: only flow hits are routed, everything else goes to the
@@ -1356,6 +1399,10 @@ index 0000000..201dd01
 ++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_EXT_ROUTE_MISMATCH, cmd) |
 ++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_EXT_PMTU_FAIL_CMD, cmd) |
 ++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_EXT_PMTU_DF_FAIL_CMD, cmd));
+++	if (ret)
+++		return ret;
+++
+++	ret = ppe_flow_tcp_excep_init(flow);
 ++	if (ret)
 ++		return ret;
 ++
@@ -1685,10 +1732,10 @@ index 0000000..201dd01
 ++#endif
 ++#endif
 +diff --git a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
-+index 0711a3545..335cdc59e 100644
++index 0711a3545..1df99fda6 100644
 +--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
 ++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
-+@@ -1113,4 +1113,164 @@
++@@ -1113,4 +1113,180 @@
 + 
 + #define PPE_P1_MULTICAST_DROP_CNT_TBL_ADDR	\
 + 	(PPE_P0_MULTICAST_DROP_CNT_TBL_ADDR + PPE_MULTICAST_QUEUE_PORT_ADDR_INC)
@@ -1740,6 +1787,22 @@ index 0000000..201dd01
 ++#define PPE_FLOW_CTRL1_BYPASS			BIT(4)
 ++#define PPE_FLOW_CTRL1_KEY_SEL			BIT(5)
 ++#define PPE_FLOW_CTRL1_DIR_MASK			GENMASK(5, 0)
+++
+++/* TCP flag patterns that raise the TCP_FLAGS_<n> L3 exceptions. */
+++#define PPE_L4_EXCEP_PARSER_CTRL_ADDR		0x1e0028
+++#define PPE_L4_EXCEP_PARSER_CTRL_INC		4
+++#define PPE_L4_EXCEP_PARSER_FLAGS(n)		(GENMASK(5, 0) << ((n) % 2 * 16))
+++#define PPE_L4_EXCEP_PARSER_MASK(n)		(GENMASK(13, 8) << ((n) % 2 * 16))
+++
+++/* L3 exceptions, indexed by exception code (CPU code - 1). */
+++#define PPE_L3_EXCEP_CMD_ADDR			0x20081c
+++#define PPE_L3_EXCEP_CMD_INC			4
+++#define PPE_L3_EXCEP_CMD_CMD			GENMASK(1, 0)
+++#define PPE_L3_EXCEP_CMD_DE_ACCE		BIT(2)
+++#define PPE_L3_FLOW_HIT_EXCEP_CTRL_ADDR		0x201678
+++#define PPE_L3_FLOW_HIT_EXCEP_CTRL_INC		4
+++#define PPE_L3_FLOW_HIT_EXCEP_CTRL_EN		BIT(0)
+++#define PPE_L3_EXCEP_TCP_FLAGS(n)		(46 + (n))
 ++
 ++#define PPE_IN_PUB_IP_ADDR_TBL_ADDR		0x2004d8
 ++#define PPE_IN_PUB_IP_ADDR_TBL_ENTRIES		16

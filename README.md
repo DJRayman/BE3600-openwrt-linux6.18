@@ -303,11 +303,14 @@ uci commit firewall && service firewall restart
 `nft list flowtables` и `conntrack -L | grep HW_OFFLOAD` показывают, что ядро отдало поток в PPE.
 
 Если трафик пропадает, выключите `flow_offloading_hw` и пришлите `dmesg | grep -i ppe`
-и вывод `/sys/kernel/debug/ppe/flow`. Параметры для экспериментов
-(`/etc/modules.d/qcom-ppe`, строка `qcom-ppe host_redirect=0`, затем перезагрузка):
+и вывод `/sys/kernel/debug/ppe/flow`. Счётчики пакетов, ушедших в CPU, и причины
+(CPU code) показывает `/sys/kernel/debug/ppe/cpu_code`.
 
-- `host_redirect=1|0` — что делать пакетам, попавшим в хост‑запись источника: отправлять в CPU (по умолчанию) или пересылать;
-- `tcp_special_bypass=1|0` — отправлять TCP SYN/FIN/RST потоков в CPU (по умолчанию да).
+Параметры для экспериментов. Они применяются после `service firewall restart`,
+постоянно задаются строкой в `/etc/modules.d/qcom-ppe`, например `qcom-ppe host_redirect=1`:
+
+- `host_redirect=0|1` — пакеты, попавшие в хост‑запись адреса, пересылать по потоку (по умолчанию, как в QSDK) или отправлять в CPU;
+- `tcp_special_bypass=0|1` — TCP SYN/FIN/RST отправлять в CPU через исключения по TCP‑флагам (по умолчанию, как в QSDK) или обходить таблицу потоков для всего, что PPE считает «особым» TCP.
 
 ### Параметры ath12k
 
