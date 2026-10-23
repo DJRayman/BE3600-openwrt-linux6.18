@@ -1,0 +1,1921 @@
+From 722daf46aa51d7c3db5c087b9585d524edb49f7f Mon Sep 17 00:00:00 2001
+From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
+Date: Thu, 22 Oct 2026 19:55:18 +0000
+Subject: [PATCH] qualcommbe: ipq53xx: PPE IPv4 flowtable offload
+ (experimental)
+
+- add patch 9115: the qcom-ppe driver offloads IPv4 TCP/UDP flows
+  from the netfilter flowtable to the PPE flow engine (SNAT, DNAT and
+  routed flows), for the EDMA ports and the yt921x DSA user ports in
+  802.1Q tagging mode;
+- enable CONFIG_QCOM_PPE_FLOW_OFFLOAD.
+
+Nothing is offloaded until the switch uses 802.1Q tagging and
+firewall flow_offloading_hw is enabled. State and counters are in
+/sys/kernel/debug/ppe/flow.
+---
+ .../linux/qualcommbe/ipq53xx/config-default   |    1 +
+ ...lcomm-ppe-add-IPv4-flowtable-offload.patch | 1879 +++++++++++++++++
+ 2 files changed, 1880 insertions(+)
+ create mode 100644 target/linux/qualcommbe/patches-6.18/9115-net-ethernet-qualcomm-ppe-add-IPv4-flowtable-offload.patch
+
+diff --git a/target/linux/qualcommbe/ipq53xx/config-default b/target/linux/qualcommbe/ipq53xx/config-default
+index 258f94b..16e8c63 100644
+--- a/target/linux/qualcommbe/ipq53xx/config-default
++++ b/target/linux/qualcommbe/ipq53xx/config-default
+@@ -46,6 +46,7 @@ CONFIG_PINCTRL_QCOM_SPMI_PMIC=y
+ CONFIG_QCA83XX_PHY=y
+ # CONFIG_QCOM_CLK_SMD_RPM is not set
+ # CONFIG_QCOM_COINCELL is not set
++CONFIG_QCOM_PPE_FLOW_OFFLOAD=y
+ # CONFIG_QCOM_RPMPD is not set
+ CONFIG_QCOM_SMD_RPM=y
+ CONFIG_QCOM_SPMI_ADC5=y
+diff --git a/target/linux/qualcommbe/patches-6.18/9115-net-ethernet-qualcomm-ppe-add-IPv4-flowtable-offload.patch b/target/linux/qualcommbe/patches-6.18/9115-net-ethernet-qualcomm-ppe-add-IPv4-flowtable-offload.patch
+new file mode 100644
+index 0000000..b378ae5
+--- /dev/null
++++ b/target/linux/qualcommbe/patches-6.18/9115-net-ethernet-qualcomm-ppe-add-IPv4-flowtable-offload.patch
+@@ -0,0 +1,1879 @@
++From d0d48963a0ed2848193cee962c637b97dab62988 Mon Sep 17 00:00:00 2001
++From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
++Date: Thu, 22 Oct 2026 19:54:55 +0000
++Subject: [PATCH] net: ethernet: qualcomm: ppe: add IPv4 flowtable offload
++
++Offload IPv4 TCP/UDP flows from the netfilter flowtable to the PPE
++flow engine (TC_SETUP_FT). Each flow gets a flow table entry, a host
++entry for its source address and a nexthop that rewrites the MACs,
++the egress VLAN, and the NAT address and port. Packets that miss in
++the PPE, fragments and TCP control packets go to the CPU as before.
++
++Supported egress/ingress devices are the EDMA ports and DSA user
++ports of a switch using the yt921x-8021q tagger; the switch port is
++selected by the 802.1Q VID the tagger uses.
++
++Flow state and counters are in debugfs at ppe/flow.
++
++This is experimental and depends on QCOM_PPE_FLOW_OFFLOAD.
++---
++ drivers/net/ethernet/qualcomm/Kconfig         |   11 +
++ drivers/net/ethernet/qualcomm/ppe/Makefile    |    2 +
++ drivers/net/ethernet/qualcomm/ppe/edma_port.c |   17 +
++ drivers/net/ethernet/qualcomm/ppe/edma_port.h |    1 +
++ drivers/net/ethernet/qualcomm/ppe/ppe.c       |    7 +
++ drivers/net/ethernet/qualcomm/ppe/ppe_flow.c  | 1494 +++++++++++++++++
++ drivers/net/ethernet/qualcomm/ppe/ppe_flow.h  |   37 +
++ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h  |  176 ++
++ 8 files changed, 1745 insertions(+)
++ create mode 100644 drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++ create mode 100644 drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++
++diff --git a/drivers/net/ethernet/qualcomm/Kconfig b/drivers/net/ethernet/qualcomm/Kconfig
++index 35dff8fad..8e80f9222 100644
++--- a/drivers/net/ethernet/qualcomm/Kconfig
+++++ b/drivers/net/ethernet/qualcomm/Kconfig
++@@ -77,6 +77,17 @@ config QCOM_PPE
++ 	  To compile this driver as a module, choose M here. The module
++ 	  will be called qcom-ppe.
++ 
+++config QCOM_PPE_FLOW_OFFLOAD
+++	bool "Qualcomm PPE IPv4 flowtable offload (experimental)"
+++	depends on QCOM_PPE
+++	help
+++	  Offload IPv4 TCP and UDP flows of a netfilter flowtable with the
+++	  offload flag (OpenWrt: hardware flow offloading) to the PPE flow
+++	  table, including source and destination NAT. Ports behind a
+++	  Motorcomm YT921x switch need the yt921x-8021q tagging protocol.
+++
+++	  The PPE is left untouched until the first flow is offloaded.
+++
++ source "drivers/net/ethernet/qualcomm/rmnet/Kconfig"
++ 
++ endif # NET_VENDOR_QUALCOMM
++diff --git a/drivers/net/ethernet/qualcomm/ppe/Makefile b/drivers/net/ethernet/qualcomm/ppe/Makefile
++index 03a9f17b1..425caf10b 100644
++--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
+++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
++@@ -8,3 +8,5 @@ qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o
++ 
++ #EDMA
++ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+++
+++qcom-ppe-$(CONFIG_QCOM_PPE_FLOW_OFFLOAD) += ppe_flow.o
++diff --git a/drivers/net/ethernet/qualcomm/ppe/edma_port.c b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++index 9e45168fe..b48e699d5 100644
++--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++@@ -15,6 +15,7 @@
++ #include "edma_cfg_rx.h"
++ #include "edma_cfg_tx.h"
++ #include "edma_port.h"
+++#include "ppe_flow.h"
++ #include "ppe_regs.h"
++ 
++ /* Number of netdev queues. */
++@@ -338,8 +339,20 @@ static const struct net_device_ops edma_port_netdev_ops = {
++ 	.ndo_eth_ioctl = edma_port_ioctl,
++ 	.ndo_features_check = edma_port_feature_check,
++ 	.ndo_select_queue = edma_port_select_queue,
+++	.ndo_setup_tc = ppe_flow_setup_tc,
++ };
++ 
+++/**
+++ * edma_port_is_edma_netdev - Check for an EDMA port net device
+++ * @netdev: Net device
+++ *
+++ * Return: true if @netdev is an EDMA port.
+++ */
+++bool edma_port_is_edma_netdev(const struct net_device *netdev)
+++{
+++	return netdev->netdev_ops == &edma_port_netdev_ops;
+++}
+++
++ /**
++  * edma_port_destroy - EDMA port destroy.
++  * @port: PPE port
++@@ -412,6 +425,10 @@ int edma_port_setup(struct ppe_port *port)
++ 	netdev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
++ 	netdev->netdev_ops = &edma_port_netdev_ops;
++ 	netdev->gso_max_segs = GSO_MAX_SEGS;
+++	if (IS_ENABLED(CONFIG_QCOM_PPE_FLOW_OFFLOAD)) {
+++		netdev->hw_features |= NETIF_F_HW_TC;
+++		netdev->features |= NETIF_F_HW_TC;
+++	}
++ 	edma_set_ethtool_ops(netdev);
++ 
++ 	maddr = mac_addr;
++diff --git a/drivers/net/ethernet/qualcomm/ppe/edma_port.h b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
++index 911d2d138..b634ccce0 100644
++--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
+++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
++@@ -92,6 +92,7 @@ struct edma_port_priv {
++ 	unsigned long flags;
++ };
++ 
+++bool edma_port_is_edma_netdev(const struct net_device *netdev);
++ void edma_port_destroy(struct ppe_port *port);
++ int edma_port_setup(struct ppe_port *port);
++ #endif
++diff --git a/drivers/net/ethernet/qualcomm/ppe/ppe.c b/drivers/net/ethernet/qualcomm/ppe/ppe.c
++index da982264e..b631608f6 100644
++--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
+++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
++@@ -18,6 +18,7 @@
++ #include "ppe.h"
++ #include "ppe_config.h"
++ #include "ppe_debugfs.h"
+++#include "ppe_flow.h"
++ #include "ppe_port.h"
++ 
++ #define PPE_PORT_MAX		8
++@@ -253,6 +254,11 @@ static int qcom_ppe_probe(struct platform_device *pdev)
++ 	}
++ 
++ 	ppe_debugfs_setup(ppe_dev);
+++
+++	ret = ppe_flow_init(ppe_dev);
+++	if (ret)
+++		dev_warn(dev, "PPE flow offload unavailable: %d\n", ret);
+++
++ 	platform_set_drvdata(pdev, ppe_dev);
++ 
++ 	return 0;
++@@ -263,6 +269,7 @@ static void qcom_ppe_remove(struct platform_device *pdev)
++ 	struct ppe_device *ppe_dev;
++ 
++ 	ppe_dev = platform_get_drvdata(pdev);
+++	ppe_flow_deinit(ppe_dev);
++ 	ppe_port_mac_deinit(ppe_dev);
++ 	ppe_debugfs_teardown(ppe_dev);
++ 	edma_destroy(ppe_dev);
++diff --git a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++new file mode 100644
++index 000000000..79ec279dc
++--- /dev/null
+++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++@@ -0,0 +1,1494 @@
+++// SPDX-License-Identifier: GPL-2.0-only
+++/*
+++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+++ */
+++
+++/* PPE IPv4 flow offload for the netfilter flowtable.
+++ *
+++ * A flowtable with the offload flag hands each direction of a connection
+++ * to the driver as a flow rule. A rule becomes:
+++ *
+++ *  - a host table entry for the source address, which the flow key refers to;
+++ *  - a flow table entry keyed by the destination address, the L4 ports, the
+++ *    protocol and that host entry, giving the forwarding type (route, SNAT or
+++ *    DNAT), the translated port and a nexthop;
+++ *  - a nexthop holding the egress port, destination MAC, the egress L3
+++ *    interface that supplies the source MAC, the VLAN to push and the
+++ *    translated address (public address index or DNAT address).
+++ *
+++ * Routing is enabled only on the ingress L3 interface of the ports that have
+++ * offloaded flows, and only for frames addressed to one of the router MACs
+++ * registered in MY_MAC by those flows. A flow table miss is redirected to the
+++ * CPU, so the PPE never routes on its own and every other frame takes the
+++ * existing path to the CPU.
+++ *
+++ * Behind a DSA switch using the yt921x-8021q tagger, frames to a user port
+++ * leave the PPE tagged with that port's TX VLAN, exactly as the tagger would
+++ * have sent them.
+++ */
+++
+++#include <linux/bitfield.h>
+++#include <linux/debugfs.h>
+++#include <linux/etherdevice.h>
+++#include <linux/if_ether.h>
+++#include <linux/if_vlan.h>
+++#include <linux/in.h>
+++#include <linux/ip.h>
+++#include <linux/moduleparam.h>
+++#include <linux/mutex.h>
+++#include <linux/netdevice.h>
+++#include <linux/regmap.h>
+++#include <linux/rhashtable.h>
+++#include <linux/seq_file.h>
+++#include <linux/slab.h>
+++#include <net/dsa.h>
+++#include <net/flow_offload.h>
+++#include <net/pkt_cls.h>
+++
+++#if IS_ENABLED(CONFIG_NET_DSA_TAG_YT921X_8021Q)
+++#include <linux/dsa/yt921x.h>
+++#endif
+++
+++#include "edma_port.h"
+++#include "ppe.h"
+++#include "ppe_flow.h"
+++#include "ppe_regs.h"
+++
+++#define PPE_FLOW_ACTION_FORWARD		0
+++#define PPE_FLOW_ACTION_REDIRECT_TO_CPU	3
+++
+++/* Index of the ingress L3 interface of a PPE port, and of the egress L3
+++ * interface that carries router MAC number n.
+++ */
+++#define PPE_FLOW_IN_L3_IF(port)		(port)
+++#define PPE_FLOW_EG_L3_IF(n)		(16 + (n))
+++
+++#define PPE_FLOW_L3_MTU			9216
+++#define PPE_FLOW_ENTRY_WORDS		6
+++#define PPE_FLOW_HOST_WORDS		3
+++#define PPE_FLOW_NEXTHOP_WORDS		4
+++#define PPE_FLOW_OP_TIMEOUT_US		1000
+++
+++static bool host_redirect;
+++module_param(host_redirect, bool, 0644);
+++MODULE_PARM_DESC(host_redirect,
+++		 "Redirect host route hits of flow source addresses to the CPU (default: false)");
+++
+++static bool tcp_special_bypass;
+++module_param(tcp_special_bypass, bool, 0644);
+++MODULE_PARM_DESC(tcp_special_bypass,
+++		 "Bypass the flow table for TCP control segments instead of using TCP flag exceptions (default: false)");
+++
+++struct ppe_flow_host {
+++	struct list_head list;
+++	__be32 addr;
+++	u16 index;
+++	unsigned int refcnt;
+++};
+++
+++struct ppe_flow_nexthop {
+++	struct list_head list;
+++	u16 index;
+++	unsigned int refcnt;
+++	int port;
+++	int mac_slot;
+++	int pub_ip;
+++	u16 cvid;
+++	bool tagged;
+++	u8 dmac[ETH_ALEN];
+++	__be32 dnat_addr;
+++};
+++
+++struct ppe_flow_entry {
+++	struct rhash_head node;
+++	struct list_head list;
+++	unsigned long cookie;
+++	u16 index;
+++	u8 fwd_type;
+++	int in_port;
+++	struct ppe_flow_host *host;
+++	struct ppe_flow_nexthop *nh;
+++	/* Router MAC slots this flow holds: egress source MAC, ingress MACs. */
+++	int mac_slots[3];
+++	int num_mac_slots;
+++	/* Flow tuple, for debugfs. */
+++	__be32 saddr, daddr, new_addr;
+++	__be16 sport, dport, new_port;
+++	u8 l4proto;
+++	u64 packets;
+++	u64 bytes;
+++};
+++
+++struct ppe_flow_mac {
+++	u8 addr[ETH_ALEN];
+++	unsigned int refcnt;
+++};
+++
+++struct ppe_flow_pub_ip {
+++	__be32 addr;
+++	unsigned int refcnt;
+++};
+++
+++struct ppe_flow {
+++	struct ppe_device *ppe_dev;
+++	struct mutex lock; /* Protects everything below and the PPE tables */
+++	struct rhashtable entries;
+++	struct list_head entry_list;
+++	struct list_head hosts;
+++	struct list_head nexthops;
+++	unsigned long *nh_map;
+++	unsigned int nh_num;
+++	struct ppe_flow_mac macs[PPE_MY_MAC_TBL_ENTRIES];
+++	struct ppe_flow_pub_ip pub_ips[PPE_IN_PUB_IP_ADDR_TBL_ENTRIES];
+++	unsigned long in_ports;
+++	unsigned int num_entries;
+++	u8 flow_cmd_id;
+++	u8 host_cmd_id;
+++	bool hw_ready;
+++	struct dentry *debugfs;
+++};
+++
+++static const struct rhashtable_params ppe_flow_ht_params = {
+++	.head_offset = offsetof(struct ppe_flow_entry, node),
+++	.key_offset = offsetof(struct ppe_flow_entry, cookie),
+++	.key_len = sizeof(unsigned long),
+++	.automatic_shrinking = true,
+++};
+++
+++static struct ppe_flow *ppe_flow_ctx;
+++
+++/* Table entries are arrays of 32-bit words; a field may cross a word. */
+++static void ppe_flow_field_set(u32 *buf, u32 field, u32 val)
+++{
+++	unsigned int lsb = PPE_TBL_FIELD_LSB(field);
+++	unsigned int width = PPE_TBL_FIELD_WIDTH(field);
+++	unsigned int done = 0;
+++
+++	while (done < width) {
+++		unsigned int bit = (lsb + done) % 32;
+++		unsigned int n = min(width - done, 32 - bit);
+++		u32 mask = GENMASK(bit + n - 1, bit);
+++		u32 *word = &buf[(lsb + done) / 32];
+++
+++		*word = (*word & ~mask) | (((val >> done) << bit) & mask);
+++		done += n;
+++	}
+++}
+++
+++static u32 ppe_flow_field_get(const u32 *buf, u32 field)
+++{
+++	unsigned int lsb = PPE_TBL_FIELD_LSB(field);
+++	unsigned int width = PPE_TBL_FIELD_WIDTH(field);
+++	unsigned int done = 0;
+++	u32 val = 0;
+++
+++	while (done < width) {
+++		unsigned int bit = (lsb + done) % 32;
+++		unsigned int n = min(width - done, 32 - bit);
+++		u32 word = buf[(lsb + done) / 32];
+++
+++		val |= ((word >> bit) & GENMASK(n - 1, 0)) << done;
+++		done += n;
+++	}
+++
+++	return val;
+++}
+++
+++/* MACs are stored as the low 16 bits (bytes 4 and 5) and the high 32 bits
+++ * (bytes 0 to 3) in the nexthop table, and the other way round, low 32 and
+++ * high 16 bits, in MY_MAC and the egress L3 interface table.
+++ */
+++static u32 ppe_flow_mac_lo32(const u8 *mac)
+++{
+++	return mac[2] << 24 | mac[3] << 16 | mac[4] << 8 | mac[5];
+++}
+++
+++static u32 ppe_flow_mac_hi16(const u8 *mac)
+++{
+++	return mac[0] << 8 | mac[1];
+++}
+++
+++static int ppe_flow_tbl_write(struct ppe_flow *flow, u32 addr,
+++			      const u32 *buf, size_t words)
+++{
+++	return regmap_bulk_write(flow->ppe_dev->regmap, addr, buf, words);
+++}
+++
+++static int ppe_flow_tbl_read(struct ppe_flow *flow, u32 addr, u32 *buf,
+++			     size_t words)
+++{
+++	return regmap_bulk_read(flow->ppe_dev->regmap, addr, buf, words);
+++}
+++
+++/* Run an add or delete on the flow or host table and return the index the
+++ * hardware used. In hash mode the entry data is written first and the
+++ * hardware picks the slot; in index mode the given entry is removed.
+++ */
+++static int ppe_flow_hash_op(struct ppe_flow *flow, bool host, u32 op_type,
+++			    u32 op_mode, const u32 *data, size_t words,
+++			    u16 *index)
+++{
+++	struct regmap *regmap = flow->ppe_dev->regmap;
+++	u32 op_addr, data_addr, rslt_addr, op, rslt, cmd_id, valid_mask;
+++	int ret, i;
+++
+++	if (host) {
+++		op_addr = PPE_HOST_TBL_OP_ADDR;
+++		data_addr = PPE_HOST_TBL_OP_DATA_ADDR;
+++		rslt_addr = PPE_HOST_TBL_OP_RSLT_ADDR;
+++		valid_mask = PPE_HOST_TBL_RSLT_VALID_CNT;
+++		cmd_id = flow->host_cmd_id++ & 0xf;
+++		op = FIELD_PREP(PPE_HOST_TBL_OP_CMD_ID, cmd_id) |
+++		     FIELD_PREP(PPE_HOST_TBL_OP_TYPE, op_type) |
+++		     FIELD_PREP(PPE_HOST_TBL_OP_HASH_BLOCK, 3) |
+++		     FIELD_PREP(PPE_HOST_TBL_OP_MODE, op_mode) |
+++		     FIELD_PREP(PPE_HOST_TBL_OP_INDEX, *index);
+++	} else {
+++		op_addr = PPE_IN_FLOW_TBL_OP_ADDR;
+++		data_addr = PPE_IN_FLOW_TBL_OP_DATA_ADDR;
+++		rslt_addr = PPE_IN_FLOW_TBL_OP_RSLT_ADDR;
+++		valid_mask = PPE_IN_FLOW_TBL_RSLT_VALID_CNT;
+++		cmd_id = flow->flow_cmd_id++ & 0xf;
+++		op = FIELD_PREP(PPE_IN_FLOW_TBL_OP_CMD_ID, cmd_id) |
+++		     FIELD_PREP(PPE_IN_FLOW_TBL_OP_TYPE, op_type) |
+++		     FIELD_PREP(PPE_IN_FLOW_TBL_OP_HASH_BLOCK, 3) |
+++		     FIELD_PREP(PPE_IN_FLOW_TBL_OP_MODE, op_mode) |
+++		     FIELD_PREP(PPE_IN_FLOW_TBL_OP_INDEX, *index);
+++	}
+++
+++	if (op_mode == PPE_TBL_OP_MODE_HASH) {
+++		for (i = 0; i < words; i++) {
+++			ret = regmap_write(regmap, data_addr + 4 * i, data[i]);
+++			if (ret)
+++				return ret;
+++		}
+++	}
+++
+++	ret = regmap_write(regmap, op_addr, op);
+++	if (ret)
+++		return ret;
+++
+++	ret = regmap_read_poll_timeout(regmap, rslt_addr, rslt,
+++				       rslt & valid_mask, 0,
+++				       PPE_FLOW_OP_TIMEOUT_US);
+++	if (ret)
+++		return ret;
+++
+++	if (host) {
+++		if (FIELD_GET(PPE_HOST_TBL_RSLT_CMD_ID, rslt) != cmd_id)
+++			dev_dbg(flow->ppe_dev->dev, "host op %u got result %lu\n",
+++				cmd_id, FIELD_GET(PPE_HOST_TBL_RSLT_CMD_ID, rslt));
+++		if (rslt & PPE_HOST_TBL_RSLT_FAIL)
+++			return -ENOSPC;
+++		*index = FIELD_GET(PPE_HOST_TBL_RSLT_INDEX, rslt);
+++	} else {
+++		if (FIELD_GET(PPE_IN_FLOW_TBL_RSLT_CMD_ID, rslt) != cmd_id)
+++			dev_dbg(flow->ppe_dev->dev, "flow op %u got result %lu\n",
+++				cmd_id, FIELD_GET(PPE_IN_FLOW_TBL_RSLT_CMD_ID, rslt));
+++		if (rslt & PPE_IN_FLOW_TBL_RSLT_FAIL)
+++			return -ENOSPC;
+++		*index = FIELD_GET(PPE_IN_FLOW_TBL_RSLT_INDEX, rslt);
+++	}
+++
+++	return 0;
+++}
+++
+++/* Rewrite the MY_MAC bitmap of every ingress L3 interface in use. */
+++static int ppe_flow_in_l3_if_sync(struct ppe_flow *flow)
+++{
+++	u32 bitmap = 0, buf[3];
+++	int i, port, ret;
+++
+++	for (i = 0; i < PPE_MY_MAC_TBL_ENTRIES; i++)
+++		if (flow->macs[i].refcnt)
+++			bitmap |= BIT(i);
+++
+++	for_each_set_bit(port, &flow->in_ports, BITS_PER_LONG) {
+++		u32 addr = PPE_IN_L3_IF_TBL_ADDR +
+++			   PPE_IN_L3_IF_TBL_INC * PPE_FLOW_IN_L3_IF(port);
+++
+++		ret = ppe_flow_tbl_read(flow, addr, buf, ARRAY_SIZE(buf));
+++		if (ret)
+++			return ret;
+++
+++		ppe_flow_field_set(buf, PPE_IN_L3_IF_W_MAC_BITMAP, bitmap);
+++		ret = ppe_flow_tbl_write(flow, addr, buf, ARRAY_SIZE(buf));
+++		if (ret)
+++			return ret;
+++	}
+++
+++	return 0;
+++}
+++
+++/* Route IPv4 unicast received on a PPE port through its own L3 interface. */
+++static int ppe_flow_in_port_enable(struct ppe_flow *flow, int port)
+++{
+++	u32 addr, buf[4] = {};
+++	int ret;
+++
+++	if (test_bit(port, &flow->in_ports))
+++		return 0;
+++
+++	ppe_flow_field_set(buf, PPE_IN_L3_IF_W_MRU, PPE_FLOW_L3_MTU);
+++	ppe_flow_field_set(buf, PPE_IN_L3_IF_W_MTU, PPE_FLOW_L3_MTU);
+++	ppe_flow_field_set(buf, PPE_IN_L3_IF_W_IPV4_UC_ROUTE_EN, 1);
+++	ppe_flow_field_set(buf, PPE_IN_L3_IF_W_TTL_EXCEED_CMD,
+++			   PPE_FLOW_ACTION_REDIRECT_TO_CPU);
+++	ppe_flow_field_set(buf, PPE_IN_L3_IF_W_TTL_EXCEED_DE_ACCE, 1);
+++	ppe_flow_field_set(buf, PPE_IN_L3_IF_W_MRU_IPV6, PPE_FLOW_L3_MTU);
+++	ppe_flow_field_set(buf, PPE_IN_L3_IF_W_MTU_IPV6, PPE_FLOW_L3_MTU);
+++	addr = PPE_IN_L3_IF_TBL_ADDR +
+++	       PPE_IN_L3_IF_TBL_INC * PPE_FLOW_IN_L3_IF(port);
+++	ret = ppe_flow_tbl_write(flow, addr, buf, 3);
+++	if (ret)
+++		return ret;
+++
+++	addr = PPE_L3_VP_PORT_TBL_ADDR + PPE_L3_VP_PORT_TBL_INC * port;
+++	ret = ppe_flow_tbl_read(flow, addr, buf, ARRAY_SIZE(buf));
+++	if (ret)
+++		return ret;
+++
+++	ppe_flow_field_set(buf, PPE_L3_VP_PORT_W_L3_IF_VALID, 1);
+++	ppe_flow_field_set(buf, PPE_L3_VP_PORT_W_L3_IF_INDEX,
+++			   PPE_FLOW_IN_L3_IF(port));
+++	ret = ppe_flow_tbl_write(flow, addr, buf, ARRAY_SIZE(buf));
+++	if (ret)
+++		return ret;
+++
+++	set_bit(port, &flow->in_ports);
+++
+++	return ppe_flow_in_l3_if_sync(flow);
+++}
+++
+++static void ppe_flow_in_port_disable(struct ppe_flow *flow, int port)
+++{
+++	u32 addr, buf[4] = {};
+++
+++	addr = PPE_L3_VP_PORT_TBL_ADDR + PPE_L3_VP_PORT_TBL_INC * port;
+++	if (!ppe_flow_tbl_read(flow, addr, buf, ARRAY_SIZE(buf))) {
+++		ppe_flow_field_set(buf, PPE_L3_VP_PORT_W_L3_IF_VALID, 0);
+++		ppe_flow_field_set(buf, PPE_L3_VP_PORT_W_L3_IF_INDEX, 0);
+++		ppe_flow_tbl_write(flow, addr, buf, ARRAY_SIZE(buf));
+++	}
+++
+++	memset(buf, 0, sizeof(buf));
+++	addr = PPE_IN_L3_IF_TBL_ADDR +
+++	       PPE_IN_L3_IF_TBL_INC * PPE_FLOW_IN_L3_IF(port);
+++	ppe_flow_tbl_write(flow, addr, buf, 3);
+++
+++	clear_bit(port, &flow->in_ports);
+++}
+++
+++/* A router MAC: frames addressed to it are routed (MY_MAC), and flows leaving
+++ * through it take it as source MAC (egress L3 interface).
+++ */
+++static int ppe_flow_mac_get(struct ppe_flow *flow, const u8 *addr)
+++{
+++	u32 buf[3] = {};
+++	int i, free = -1, ret;
+++
+++	for (i = 0; i < PPE_MY_MAC_TBL_ENTRIES; i++) {
+++		if (flow->macs[i].refcnt &&
+++		    ether_addr_equal(flow->macs[i].addr, addr)) {
+++			flow->macs[i].refcnt++;
+++			return i;
+++		}
+++
+++		if (!flow->macs[i].refcnt && free < 0)
+++			free = i;
+++	}
+++
+++	if (free < 0)
+++		return -ENOSPC;
+++
+++	ppe_flow_field_set(buf, PPE_EG_L3_IF_W_MAC_LO, ppe_flow_mac_lo32(addr));
+++	ppe_flow_field_set(buf, PPE_EG_L3_IF_W_MAC_HI, ppe_flow_mac_hi16(addr));
+++	ret = ppe_flow_tbl_write(flow, PPE_EG_L3_IF_TBL_ADDR +
+++				 PPE_EG_L3_IF_TBL_INC * PPE_FLOW_EG_L3_IF(free),
+++				 buf, 3);
+++	if (ret)
+++		return ret;
+++
+++	memset(buf, 0, sizeof(buf));
+++	ppe_flow_field_set(buf, PPE_MY_MAC_W_MAC_LO, ppe_flow_mac_lo32(addr));
+++	ppe_flow_field_set(buf, PPE_MY_MAC_W_MAC_HI, ppe_flow_mac_hi16(addr));
+++	ppe_flow_field_set(buf, PPE_MY_MAC_W_VALID, 1);
+++	ret = ppe_flow_tbl_write(flow, PPE_MY_MAC_TBL_ADDR +
+++				 PPE_MY_MAC_TBL_INC * free, buf, 2);
+++	if (ret)
+++		return ret;
+++
+++	ether_addr_copy(flow->macs[free].addr, addr);
+++	flow->macs[free].refcnt = 1;
+++
+++	ret = ppe_flow_in_l3_if_sync(flow);
+++	if (ret) {
+++		flow->macs[free].refcnt = 0;
+++		return ret;
+++	}
+++
+++	return free;
+++}
+++
+++static void ppe_flow_mac_put(struct ppe_flow *flow, int slot)
+++{
+++	u32 buf[3] = {};
+++
+++	if (--flow->macs[slot].refcnt)
+++		return;
+++
+++	eth_zero_addr(flow->macs[slot].addr);
+++	ppe_flow_in_l3_if_sync(flow);
+++	ppe_flow_tbl_write(flow, PPE_MY_MAC_TBL_ADDR +
+++			   PPE_MY_MAC_TBL_INC * slot, buf, 2);
+++	ppe_flow_tbl_write(flow, PPE_EG_L3_IF_TBL_ADDR +
+++			   PPE_EG_L3_IF_TBL_INC * PPE_FLOW_EG_L3_IF(slot),
+++			   buf, 3);
+++}
+++
+++static int ppe_flow_pub_ip_get(struct ppe_flow *flow, __be32 addr)
+++{
+++	int i, free = -1, ret;
+++
+++	for (i = 0; i < PPE_IN_PUB_IP_ADDR_TBL_ENTRIES; i++) {
+++		if (flow->pub_ips[i].refcnt && flow->pub_ips[i].addr == addr) {
+++			flow->pub_ips[i].refcnt++;
+++			return i;
+++		}
+++
+++		if (!flow->pub_ips[i].refcnt && free < 0)
+++			free = i;
+++	}
+++
+++	if (free < 0)
+++		return -ENOSPC;
+++
+++	ret = regmap_write(flow->ppe_dev->regmap, PPE_IN_PUB_IP_ADDR_TBL_ADDR +
+++			   PPE_IN_PUB_IP_ADDR_TBL_INC * free, be32_to_cpu(addr));
+++	if (ret)
+++		return ret;
+++
+++	flow->pub_ips[free].addr = addr;
+++	flow->pub_ips[free].refcnt = 1;
+++
+++	return free;
+++}
+++
+++static void ppe_flow_pub_ip_put(struct ppe_flow *flow, int index)
+++{
+++	if (--flow->pub_ips[index].refcnt)
+++		return;
+++
+++	flow->pub_ips[index].addr = 0;
+++	regmap_write(flow->ppe_dev->regmap, PPE_IN_PUB_IP_ADDR_TBL_ADDR +
+++		     PPE_IN_PUB_IP_ADDR_TBL_INC * index, 0);
+++}
+++
+++static struct ppe_flow_host *ppe_flow_host_get(struct ppe_flow *flow,
+++					       __be32 addr)
+++{
+++	u32 buf[PPE_FLOW_HOST_WORDS] = {};
+++	struct ppe_flow_host *host;
+++	u16 index = 0;
+++	int ret;
+++
+++	list_for_each_entry(host, &flow->hosts, list) {
+++		if (host->addr == addr) {
+++			host->refcnt++;
+++			return host;
+++		}
+++	}
+++
+++	host = kzalloc(sizeof(*host), GFP_KERNEL);
+++	if (!host)
+++		return ERR_PTR(-ENOMEM);
+++
+++	/* The entry only names the address for the flow key. Should a routed
+++	 * frame look up this address as its destination, it goes to the CPU.
+++	 */
+++	ppe_flow_field_set(buf, PPE_HOST_W_VALID, 1);
+++	ppe_flow_field_set(buf, PPE_HOST_W_KEY_TYPE, 0);
+++	ppe_flow_field_set(buf, PPE_HOST_W_FWD_CMD,
+++			   host_redirect ? PPE_FLOW_ACTION_REDIRECT_TO_CPU :
+++			   PPE_FLOW_ACTION_FORWARD);
+++	ppe_flow_field_set(buf, PPE_HOST_W_IP_ADDR, be32_to_cpu(addr));
+++
+++	ret = ppe_flow_hash_op(flow, true, PPE_TBL_OP_ADD,
+++			       PPE_TBL_OP_MODE_HASH, buf, ARRAY_SIZE(buf),
+++			       &index);
+++	if (ret) {
+++		kfree(host);
+++		return ERR_PTR(ret);
+++	}
+++
+++	host->addr = addr;
+++	host->index = index;
+++	host->refcnt = 1;
+++	list_add(&host->list, &flow->hosts);
+++
+++	return host;
+++}
+++
+++static void ppe_flow_host_put(struct ppe_flow *flow, struct ppe_flow_host *host)
+++{
+++	u16 index = host->index;
+++
+++	if (--host->refcnt)
+++		return;
+++
+++	ppe_flow_hash_op(flow, true, PPE_TBL_OP_DEL, PPE_TBL_OP_MODE_INDEX,
+++			 NULL, 0, &index);
+++	list_del(&host->list);
+++	kfree(host);
+++}
+++
+++static struct ppe_flow_nexthop *
+++ppe_flow_nexthop_get(struct ppe_flow *flow, const struct ppe_flow_nexthop *key)
+++{
+++	u32 buf[PPE_FLOW_NEXTHOP_WORDS] = {};
+++	struct ppe_flow_nexthop *nh;
+++	unsigned int index;
+++	int ret;
+++
+++	list_for_each_entry(nh, &flow->nexthops, list) {
+++		if (nh->port == key->port && nh->mac_slot == key->mac_slot &&
+++		    nh->pub_ip == key->pub_ip && nh->tagged == key->tagged &&
+++		    nh->cvid == key->cvid && nh->dnat_addr == key->dnat_addr &&
+++		    ether_addr_equal(nh->dmac, key->dmac)) {
+++			nh->refcnt++;
+++			return nh;
+++		}
+++	}
+++
+++	index = find_first_zero_bit(flow->nh_map, flow->nh_num);
+++	if (index >= flow->nh_num)
+++		return ERR_PTR(-ENOSPC);
+++
+++	nh = kmemdup(key, sizeof(*nh), GFP_KERNEL);
+++	if (!nh)
+++		return ERR_PTR(-ENOMEM);
+++
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_TYPE_PORT, 1);
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_PORT, key->port);
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_POST_L3_IF,
+++			   PPE_FLOW_EG_L3_IF(key->mac_slot));
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_CTAG_FMT, key->tagged);
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_CVID, key->cvid);
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_PUB_IP_INDEX,
+++			   key->pub_ip >= 0 ? key->pub_ip : 0);
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_MAC_LO,
+++			   key->dmac[4] << 8 | key->dmac[5]);
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_MAC_HI,
+++			   key->dmac[0] << 24 | key->dmac[1] << 16 |
+++			   key->dmac[2] << 8 | key->dmac[3]);
+++	ppe_flow_field_set(buf, PPE_IN_NEXTHOP_W_DNAT_IP,
+++			   be32_to_cpu(key->dnat_addr));
+++
+++	ret = ppe_flow_tbl_write(flow, PPE_IN_NEXTHOP_TBL_ADDR +
+++				 PPE_IN_NEXTHOP_TBL_INC * index,
+++				 buf, ARRAY_SIZE(buf));
+++	if (ret) {
+++		kfree(nh);
+++		return ERR_PTR(ret);
+++	}
+++
+++	set_bit(index, flow->nh_map);
+++	nh->index = index;
+++	nh->refcnt = 1;
+++	list_add(&nh->list, &flow->nexthops);
+++
+++	return nh;
+++}
+++
+++static void ppe_flow_nexthop_put(struct ppe_flow *flow,
+++				 struct ppe_flow_nexthop *nh)
+++{
+++	u32 buf[PPE_FLOW_NEXTHOP_WORDS] = {};
+++
+++	if (--nh->refcnt)
+++		return;
+++
+++	if (nh->pub_ip >= 0)
+++		ppe_flow_pub_ip_put(flow, nh->pub_ip);
+++
+++	ppe_flow_tbl_write(flow, PPE_IN_NEXTHOP_TBL_ADDR +
+++			   PPE_IN_NEXTHOP_TBL_INC * nh->index,
+++			   buf, ARRAY_SIZE(buf));
+++	clear_bit(nh->index, flow->nh_map);
+++	list_del(&nh->list);
+++	kfree(nh);
+++}
+++
+++/* PPE port behind a net device: an EDMA port itself, or the conduit of a
+++ * DSA user port. For a yt921x-8021q user port also return the VLAN that
+++ * addresses the port.
+++ */
+++static int ppe_flow_dev_port(struct net_device *dev, bool *tagged, u16 *vid)
+++{
+++	struct edma_port_priv *port_priv;
+++
+++	*tagged = false;
+++	*vid = 0;
+++
+++#if IS_REACHABLE(CONFIG_NET_DSA)
+++	if (!edma_port_is_edma_netdev(dev)) {
+++		struct dsa_port *dp = dsa_port_from_netdev(dev);
+++
+++		if (IS_ERR(dp))
+++			return -EOPNOTSUPP;
+++
+++		switch (dp->cpu_dp->tag_ops->proto) {
+++#if IS_ENABLED(CONFIG_NET_DSA_TAG_YT921X_8021Q)
+++		case DSA_TAG_PROTO_YT921X_8021Q:
+++			*tagged = true;
+++			*vid = yt921x_8021q_tx_vid(dp->index);
+++			break;
+++#endif
+++		default:
+++			return -EOPNOTSUPP;
+++		}
+++
+++		dev = dsa_port_to_conduit(dp);
+++	}
+++#endif
+++
+++	if (!edma_port_is_edma_netdev(dev))
+++		return -EOPNOTSUPP;
+++
+++	port_priv = netdev_priv(dev);
+++
+++	return port_priv->ppe_port->port_id;
+++}
+++
+++struct ppe_flow_data {
+++	int in_port;
+++	/* Addresses of the ingress device and of its bridge */
+++	u8 in_addrs[2][ETH_ALEN];
+++	u8 h_dest[ETH_ALEN];
+++	u8 h_source[ETH_ALEN];
+++	__be32 saddr, daddr;
+++	__be32 new_saddr, new_daddr;
+++	__be16 sport, dport;
+++	__be16 new_sport, new_dport;
+++	u8 l4proto;
+++};
+++
+++static void ppe_flow_mangle_eth(const struct flow_action_entry *act,
+++				struct ppe_flow_data *data)
+++{
+++	u8 eth[ETH_ALEN * 2];
+++	const void *src = &act->mangle.val;
+++	void *dest;
+++
+++	if (act->mangle.offset > 8)
+++		return;
+++
+++	memcpy(eth, data->h_dest, ETH_ALEN);
+++	memcpy(eth + ETH_ALEN, data->h_source, ETH_ALEN);
+++	dest = eth + act->mangle.offset;
+++
+++	if (act->mangle.mask == 0xffff) {
+++		src += 2;
+++		dest += 2;
+++	}
+++
+++	memcpy(dest, src, act->mangle.mask ? 2 : 4);
+++	memcpy(data->h_dest, eth, ETH_ALEN);
+++	memcpy(data->h_source, eth + ETH_ALEN, ETH_ALEN);
+++}
+++
+++static int ppe_flow_mangle_ports(const struct flow_action_entry *act,
+++				 struct ppe_flow_data *data)
+++{
+++	u32 val = ntohl(act->mangle.val);
+++
+++	switch (act->mangle.offset) {
+++	case 0:
+++		if (act->mangle.mask == ~htonl(0xffff))
+++			data->new_dport = cpu_to_be16(val);
+++		else
+++			data->new_sport = cpu_to_be16(val >> 16);
+++		break;
+++	case 2:
+++		data->new_dport = cpu_to_be16(val);
+++		break;
+++	default:
+++		return -EINVAL;
+++	}
+++
+++	return 0;
+++}
+++
+++static int ppe_flow_mangle_ipv4(const struct flow_action_entry *act,
+++				struct ppe_flow_data *data)
+++{
+++	switch (act->mangle.offset) {
+++	case offsetof(struct iphdr, saddr):
+++		data->new_saddr = (__force __be32)act->mangle.val;
+++		break;
+++	case offsetof(struct iphdr, daddr):
+++		data->new_daddr = (__force __be32)act->mangle.val;
+++		break;
+++	default:
+++		return -EINVAL;
+++	}
+++
+++	return 0;
+++}
+++
+++/* Take the IPv4 TCP/UDP tuple and the ingress PPE port from the match. */
+++static int ppe_flow_parse_match(struct flow_cls_offload *f,
+++				struct ppe_flow_data *data)
+++{
+++	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+++	struct flow_match_ipv4_addrs addrs;
+++	struct net_device *idev, *upper;
+++	struct flow_match_control control;
+++	struct flow_match_basic basic;
+++	struct flow_match_ports ports;
+++	struct flow_match_meta meta;
+++	bool tagged;
+++	u16 vid;
+++
+++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
+++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
+++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS) ||
+++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
+++		return -EOPNOTSUPP;
+++
+++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
+++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN))
+++		return -EOPNOTSUPP;
+++
+++	flow_rule_match_control(rule, &control);
+++	if (control.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
+++	    flow_rule_has_control_flags(control.mask->flags, f->common.extack))
+++		return -EOPNOTSUPP;
+++
+++	flow_rule_match_basic(rule, &basic);
+++	data->l4proto = basic.key->ip_proto;
+++	if (data->l4proto != IPPROTO_TCP && data->l4proto != IPPROTO_UDP)
+++		return -EOPNOTSUPP;
+++
+++	flow_rule_match_ipv4_addrs(rule, &addrs);
+++	data->saddr = addrs.key->src;
+++	data->daddr = addrs.key->dst;
+++
+++	flow_rule_match_ports(rule, &ports);
+++	data->sport = ports.key->src;
+++	data->dport = ports.key->dst;
+++
+++	flow_rule_match_meta(rule, &meta);
+++
+++	rcu_read_lock();
+++	idev = dev_get_by_index_rcu(&init_net, meta.key->ingress_ifindex);
+++	if (!idev) {
+++		rcu_read_unlock();
+++		return -ENODEV;
+++	}
+++
+++	data->in_port = ppe_flow_dev_port(idev, &tagged, &vid);
+++	ether_addr_copy(data->in_addrs[0], idev->dev_addr);
+++	upper = netdev_master_upper_dev_get_rcu(idev);
+++	if (upper)
+++		ether_addr_copy(data->in_addrs[1], upper->dev_addr);
+++	rcu_read_unlock();
+++
+++	return data->in_port < 0 ? data->in_port : 0;
+++}
+++
+++static void ppe_flow_entry_release(struct ppe_flow *flow,
+++				   struct ppe_flow_entry *entry)
+++{
+++	int i;
+++
+++	if (entry->nh)
+++		ppe_flow_nexthop_put(flow, entry->nh);
+++
+++	if (entry->host)
+++		ppe_flow_host_put(flow, entry->host);
+++
+++	for (i = 0; i < entry->num_mac_slots; i++)
+++		ppe_flow_mac_put(flow, entry->mac_slots[i]);
+++}
+++
+++static int ppe_flow_entry_hold_mac(struct ppe_flow *flow,
+++				   struct ppe_flow_entry *entry, const u8 *addr)
+++{
+++	int slot;
+++
+++	if (!is_valid_ether_addr(addr))
+++		return 0;
+++
+++	slot = ppe_flow_mac_get(flow, addr);
+++	if (slot < 0)
+++		return slot;
+++
+++	entry->mac_slots[entry->num_mac_slots++] = slot;
+++
+++	return slot;
+++}
+++
+++static int ppe_flow_replace(struct ppe_flow *flow, struct flow_cls_offload *f)
+++{
+++	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+++	struct ppe_flow_nexthop nh_key = { .pub_ip = -1 };
+++	u32 buf[PPE_FLOW_ENTRY_WORDS] = {};
+++	struct net_device *odev = NULL;
+++	struct ppe_flow_data data = {};
+++	struct ppe_flow_entry *entry;
+++	struct flow_action_entry *act;
+++	int out_port, ret, i;
+++	u32 proto;
+++
+++	if (rhashtable_lookup_fast(&flow->entries, &f->cookie, ppe_flow_ht_params))
+++		return -EEXIST;
+++
+++	ret = ppe_flow_parse_match(f, &data);
+++	if (ret)
+++		return ret;
+++
+++	proto = data.l4proto == IPPROTO_TCP ? PPE_FLOW_PROTO_TCP :
+++					      PPE_FLOW_PROTO_UDP;
+++	data.new_saddr = data.saddr;
+++	data.new_daddr = data.daddr;
+++	data.new_sport = data.sport;
+++	data.new_dport = data.dport;
+++
+++	flow_action_for_each(i, act, &rule->action) {
+++		switch (act->id) {
+++		case FLOW_ACTION_MANGLE:
+++			switch (act->mangle.htype) {
+++			case FLOW_ACT_MANGLE_HDR_TYPE_ETH:
+++				ppe_flow_mangle_eth(act, &data);
+++				ret = 0;
+++				break;
+++			case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
+++				ret = ppe_flow_mangle_ipv4(act, &data);
+++				break;
+++			case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
+++			case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
+++				ret = ppe_flow_mangle_ports(act, &data);
+++				break;
+++			default:
+++				ret = -EOPNOTSUPP;
+++				break;
+++			}
+++			if (ret)
+++				return ret;
+++			break;
+++		case FLOW_ACTION_REDIRECT:
+++			odev = act->dev;
+++			break;
+++		case FLOW_ACTION_CSUM:
+++			break;
+++		default:
+++			/* VLAN and PPPoE encapsulation are not handled yet. */
+++			return -EOPNOTSUPP;
+++		}
+++	}
+++
+++	if (!odev || !is_valid_ether_addr(data.h_source) ||
+++	    !is_valid_ether_addr(data.h_dest))
+++		return -EOPNOTSUPP;
+++
+++	out_port = ppe_flow_dev_port(odev, &nh_key.tagged, &nh_key.cvid);
+++	if (out_port < 0)
+++		return out_port;
+++
+++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+++	if (!entry)
+++		return -ENOMEM;
+++
+++	entry->cookie = f->cookie;
+++	entry->in_port = data.in_port;
+++	entry->saddr = data.saddr;
+++	entry->daddr = data.daddr;
+++	entry->sport = data.sport;
+++	entry->dport = data.dport;
+++	entry->l4proto = data.l4proto;
+++
+++	if (data.new_saddr != data.saddr && data.new_daddr != data.daddr) {
+++		ret = -EOPNOTSUPP;
+++		goto err_free;
+++	} else if (data.new_saddr != data.saddr) {
+++		entry->fwd_type = PPE_FLOW_FWD_SNAT;
+++		entry->new_addr = data.new_saddr;
+++		entry->new_port = data.new_sport;
+++		if (data.new_dport != data.dport) {
+++			ret = -EOPNOTSUPP;
+++			goto err_free;
+++		}
+++	} else if (data.new_daddr != data.daddr) {
+++		entry->fwd_type = PPE_FLOW_FWD_DNAT;
+++		entry->new_addr = data.new_daddr;
+++		entry->new_port = data.new_dport;
+++		if (data.new_sport != data.sport) {
+++			ret = -EOPNOTSUPP;
+++			goto err_free;
+++		}
+++	} else {
+++		entry->fwd_type = PPE_FLOW_FWD_ROUTE;
+++		if (data.new_sport != data.sport ||
+++		    data.new_dport != data.dport) {
+++			ret = -EOPNOTSUPP;
+++			goto err_free;
+++		}
+++	}
+++
+++	/* Router MACs: the egress source MAC, and the addresses frames of
+++	 * this flow arrive with (the ingress port and its bridge).
+++	 */
+++	ret = ppe_flow_entry_hold_mac(flow, entry, data.h_source);
+++	if (ret < 0)
+++		goto err_release;
+++	nh_key.mac_slot = ret;
+++
+++	for (i = 0; i < ARRAY_SIZE(data.in_addrs); i++) {
+++		if (ether_addr_equal(data.in_addrs[i], data.h_source) ||
+++		    (i && ether_addr_equal(data.in_addrs[i], data.in_addrs[0])))
+++			continue;
+++
+++		ret = ppe_flow_entry_hold_mac(flow, entry, data.in_addrs[i]);
+++		if (ret < 0)
+++			goto err_release;
+++	}
+++
+++	ret = ppe_flow_in_port_enable(flow, data.in_port);
+++	if (ret)
+++		goto err_release;
+++
+++	nh_key.port = out_port;
+++	ether_addr_copy(nh_key.dmac, data.h_dest);
+++	if (entry->fwd_type == PPE_FLOW_FWD_SNAT) {
+++		ret = ppe_flow_pub_ip_get(flow, data.new_saddr);
+++		if (ret < 0)
+++			goto err_release;
+++		nh_key.pub_ip = ret;
+++	} else if (entry->fwd_type == PPE_FLOW_FWD_DNAT) {
+++		nh_key.dnat_addr = data.new_daddr;
+++	}
+++
+++	entry->nh = ppe_flow_nexthop_get(flow, &nh_key);
+++	if (IS_ERR(entry->nh)) {
+++		ret = PTR_ERR(entry->nh);
+++		entry->nh = NULL;
+++		if (nh_key.pub_ip >= 0)
+++			ppe_flow_pub_ip_put(flow, nh_key.pub_ip);
+++		goto err_release;
+++	}
+++
+++	/* A new nexthop keeps the public address reference taken above; an
+++	 * existing one already holds its own.
+++	 */
+++	if (entry->nh->refcnt > 1 && nh_key.pub_ip >= 0)
+++		ppe_flow_pub_ip_put(flow, nh_key.pub_ip);
+++
+++	entry->host = ppe_flow_host_get(flow, data.saddr);
+++	if (IS_ERR(entry->host)) {
+++		ret = PTR_ERR(entry->host);
+++		entry->host = NULL;
+++		goto err_release;
+++	}
+++
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_VALID, 1);
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_ENTRY_TYPE, 0);
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_HOST_INDEX_TYPE, 0);
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_HOST_INDEX, entry->host->index);
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_PROTOCOL, proto);
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_FWD_TYPE, entry->fwd_type);
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_NEXTHOP, entry->nh->index);
+++	if (entry->fwd_type != PPE_FLOW_FWD_ROUTE)
+++		ppe_flow_field_set(buf, PPE_IN_FLOW_W_NAT_L4_PORT,
+++				   be16_to_cpu(entry->new_port));
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_IP_ADDR, be32_to_cpu(data.daddr));
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_L4_SPORT, be16_to_cpu(data.sport));
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_L4_DPORT, be16_to_cpu(data.dport));
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_PMTU_CHECK_L3, 1);
+++	ppe_flow_field_set(buf, PPE_IN_FLOW_W_PMTU, READ_ONCE(odev->mtu));
+++
+++	ret = ppe_flow_hash_op(flow, false, PPE_TBL_OP_ADD,
+++			       PPE_TBL_OP_MODE_HASH, buf, ARRAY_SIZE(buf),
+++			       &entry->index);
+++	if (ret)
+++		goto err_release;
+++
+++	/* Start counting from zero for this flow. */
+++	memset(buf, 0, sizeof(buf));
+++	ppe_flow_tbl_write(flow, PPE_IN_FLOW_CNT_TBL_ADDR +
+++			   PPE_IN_FLOW_CNT_TBL_INC * entry->index, buf, 3);
+++
+++	ret = rhashtable_insert_fast(&flow->entries, &entry->node,
+++				     ppe_flow_ht_params);
+++	if (ret)
+++		goto err_del;
+++
+++	list_add_tail(&entry->list, &flow->entry_list);
+++	flow->num_entries++;
+++
+++	return 0;
+++
+++err_del:
+++	ppe_flow_hash_op(flow, false, PPE_TBL_OP_DEL, PPE_TBL_OP_MODE_INDEX,
+++			 NULL, 0, &entry->index);
+++err_release:
+++	ppe_flow_entry_release(flow, entry);
+++err_free:
+++	kfree(entry);
+++	return ret;
+++}
+++
+++static void ppe_flow_entry_destroy(struct ppe_flow *flow,
+++				   struct ppe_flow_entry *entry)
+++{
+++	ppe_flow_hash_op(flow, false, PPE_TBL_OP_DEL, PPE_TBL_OP_MODE_INDEX,
+++			 NULL, 0, &entry->index);
+++	rhashtable_remove_fast(&flow->entries, &entry->node, ppe_flow_ht_params);
+++	list_del(&entry->list);
+++	flow->num_entries--;
+++	ppe_flow_entry_release(flow, entry);
+++	kfree(entry);
+++}
+++
+++static int ppe_flow_destroy(struct ppe_flow *flow, struct flow_cls_offload *f)
+++{
+++	struct ppe_flow_entry *entry;
+++
+++	entry = rhashtable_lookup_fast(&flow->entries, &f->cookie,
+++				       ppe_flow_ht_params);
+++	if (!entry)
+++		return -ENOENT;
+++
+++	ppe_flow_entry_destroy(flow, entry);
+++
+++	return 0;
+++}
+++
+++/* Read the hit counters of a flow, and clear them when asked to. */
+++static int ppe_flow_counters(struct ppe_flow *flow,
+++			     struct ppe_flow_entry *entry, u64 *packets,
+++			     u64 *bytes, bool clear)
+++{
+++	u32 addr = PPE_IN_FLOW_CNT_TBL_ADDR +
+++		   PPE_IN_FLOW_CNT_TBL_INC * entry->index;
+++	u32 buf[3], zero[3] = {};
+++	int ret;
+++
+++	ret = ppe_flow_tbl_read(flow, addr, buf, ARRAY_SIZE(buf));
+++	if (ret)
+++		return ret;
+++
+++	*packets = ppe_flow_field_get(buf, PPE_IN_FLOW_CNT_W_PKTS);
+++	*bytes = ppe_flow_field_get(buf, PPE_IN_FLOW_CNT_W_BYTES_LO) |
+++		 (u64)ppe_flow_field_get(buf, PPE_IN_FLOW_CNT_W_BYTES_HI) << 32;
+++
+++	if (clear && *packets)
+++		ret = ppe_flow_tbl_write(flow, addr, zero, ARRAY_SIZE(zero));
+++
+++	return ret;
+++}
+++
+++static int ppe_flow_stats(struct ppe_flow *flow, struct flow_cls_offload *f)
+++{
+++	struct ppe_flow_entry *entry;
+++	u64 packets, bytes;
+++	int ret;
+++
+++	entry = rhashtable_lookup_fast(&flow->entries, &f->cookie,
+++				       ppe_flow_ht_params);
+++	if (!entry)
+++		return -ENOENT;
+++
+++	ret = ppe_flow_counters(flow, entry, &packets, &bytes, true);
+++	if (ret)
+++		return ret;
+++
+++	if (packets) {
+++		entry->packets += packets;
+++		entry->bytes += bytes;
+++		flow_stats_update(&f->stats, bytes, packets, 0, jiffies,
+++				  FLOW_ACTION_HW_STATS_IMMEDIATE);
+++	}
+++
+++	return 0;
+++}
+++
+++static void ppe_flow_flush(struct ppe_flow *flow)
+++{
+++	struct ppe_flow_entry *entry, *tmp;
+++	int port;
+++
+++	list_for_each_entry_safe(entry, tmp, &flow->entry_list, list)
+++		ppe_flow_entry_destroy(flow, entry);
+++
+++	for_each_set_bit(port, &flow->in_ports, BITS_PER_LONG)
+++		ppe_flow_in_port_disable(flow, port);
+++
+++	/* Apply changed module parameters with the next flow. */
+++	flow->hw_ready = false;
+++}
+++
+++/* Send TCP FIN, SYN and RST segments of offloaded flows to the CPU, so that
+++ * conntrack sees the connection close, through the TCP_FLAGS_0..2 exceptions
+++ * as the vendor driver does.
+++ */
+++static int ppe_flow_tcp_excep_init(struct ppe_flow *flow)
+++{
+++	static const u8 tcp_flags[] = { 0x01, 0x02, 0x04 };
+++	struct regmap *regmap = flow->ppe_dev->regmap;
+++	u32 addr, exp;
+++	int ret, i;
+++
+++	for (i = 0; i < ARRAY_SIZE(tcp_flags); i++) {
+++		addr = PPE_L4_EXCEP_PARSER_CTRL_ADDR +
+++		       PPE_L4_EXCEP_PARSER_CTRL_INC * (i / 2);
+++		ret = regmap_update_bits(regmap, addr,
+++					 PPE_L4_EXCEP_PARSER_FLAGS(i) |
+++					 PPE_L4_EXCEP_PARSER_MASK(i),
+++					 (tcp_flags[i] << __ffs(PPE_L4_EXCEP_PARSER_FLAGS(i))) |
+++					 (tcp_flags[i] << __ffs(PPE_L4_EXCEP_PARSER_MASK(i))));
+++		if (ret)
+++			return ret;
+++
+++		exp = PPE_L3_EXCEP_TCP_FLAGS(i);
+++		ret = regmap_write(regmap, PPE_L3_EXCEP_CMD_ADDR +
+++				   PPE_L3_EXCEP_CMD_INC * exp,
+++				   FIELD_PREP(PPE_L3_EXCEP_CMD_CMD,
+++					      PPE_FLOW_ACTION_REDIRECT_TO_CPU));
+++		if (ret)
+++			return ret;
+++
+++		ret = regmap_write(regmap, PPE_L3_FLOW_HIT_EXCEP_CTRL_ADDR +
+++				   PPE_L3_FLOW_HIT_EXCEP_CTRL_INC * exp,
+++				   PPE_L3_FLOW_HIT_EXCEP_CTRL_EN);
+++		if (ret)
+++			return ret;
+++	}
+++
+++	return 0;
+++}
+++
+++/* Global L3 settings: only flow hits are routed, everything else goes to the
+++ * CPU, as do frames failing an MTU check and TCP control segments.
+++ */
+++static int ppe_flow_hw_init(struct ppe_flow *flow)
+++{
+++	struct regmap *regmap = flow->ppe_dev->regmap;
+++	u32 mask = 0, val = 0, dir_val, cmd;
+++	int ret, dir;
+++
+++	cmd = PPE_FLOW_ACTION_REDIRECT_TO_CPU;
+++	ret = regmap_update_bits(regmap, PPE_L3_ROUTE_CTRL_ADDR,
+++				 PPE_L3_ROUTE_CTRL_MRU_FAIL_CMD |
+++				 PPE_L3_ROUTE_CTRL_MRU_FAIL_DE_ACCE |
+++				 PPE_L3_ROUTE_CTRL_MTU_FAIL_CMD |
+++				 PPE_L3_ROUTE_CTRL_MTU_FAIL_DE_ACCE |
+++				 PPE_L3_ROUTE_CTRL_MTU_DF_FAIL_CMD |
+++				 PPE_L3_ROUTE_CTRL_MTU_DF_FAIL_DE_ACCE,
+++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_MRU_FAIL_CMD, cmd) |
+++				 PPE_L3_ROUTE_CTRL_MRU_FAIL_DE_ACCE |
+++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_MTU_FAIL_CMD, cmd) |
+++				 PPE_L3_ROUTE_CTRL_MTU_FAIL_DE_ACCE |
+++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_MTU_DF_FAIL_CMD, cmd));
+++	if (ret)
+++		return ret;
+++
+++	ret = regmap_update_bits(regmap, PPE_L3_ROUTE_CTRL_EXT_ADDR,
+++				 PPE_L3_ROUTE_CTRL_EXT_ROUTE_MISMATCH |
+++				 PPE_L3_ROUTE_CTRL_EXT_PMTU_FAIL_CMD |
+++				 PPE_L3_ROUTE_CTRL_EXT_PMTU_FAIL_DE_ACCE |
+++				 PPE_L3_ROUTE_CTRL_EXT_PMTU_DF_FAIL_CMD |
+++				 PPE_L3_ROUTE_CTRL_EXT_PMTU_DF_DE_ACCE,
+++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_EXT_ROUTE_MISMATCH, cmd) |
+++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_EXT_PMTU_FAIL_CMD, cmd) |
+++				 FIELD_PREP(PPE_L3_ROUTE_CTRL_EXT_PMTU_DF_FAIL_CMD, cmd));
+++	if (ret)
+++		return ret;
+++
+++	ret = ppe_flow_tcp_excep_init(flow);
+++	if (ret)
+++		return ret;
+++
+++	dir_val = FIELD_PREP(PPE_FLOW_CTRL1_MISS_CMD, cmd) |
+++		  PPE_FLOW_CTRL1_FRAG_BYPASS;
+++	if (tcp_special_bypass)
+++		dir_val |= PPE_FLOW_CTRL1_TCP_SPECIAL;
+++
+++	for (dir = 0; dir < PPE_FLOW_CTRL1_DIRS; dir++) {
+++		mask |= PPE_FLOW_CTRL1_DIR_MASK << PPE_FLOW_CTRL1_DIR_SHIFT(dir);
+++		val |= dir_val << PPE_FLOW_CTRL1_DIR_SHIFT(dir);
+++	}
+++
+++	ret = regmap_update_bits(regmap, PPE_FLOW_CTRL1_ADDR +
+++				 PPE_FLOW_CTRL1_INC * PPE_FLOW_CTRL1_L3_UNICAST,
+++				 mask, val);
+++	if (ret)
+++		return ret;
+++
+++	return regmap_set_bits(regmap, PPE_FLOW_CTRL0_ADDR,
+++			       PPE_FLOW_CTRL0_FLOW_EN);
+++}
+++
+++static int ppe_flow_cmd(struct ppe_flow *flow, struct flow_cls_offload *cls)
+++{
+++	int ret;
+++
+++	mutex_lock(&flow->lock);
+++
+++	if (!flow->hw_ready) {
+++		ret = ppe_flow_hw_init(flow);
+++		if (ret)
+++			goto out;
+++		flow->hw_ready = true;
+++	}
+++
+++	switch (cls->command) {
+++	case FLOW_CLS_REPLACE:
+++		ret = ppe_flow_replace(flow, cls);
+++		break;
+++	case FLOW_CLS_DESTROY:
+++		ret = ppe_flow_destroy(flow, cls);
+++		break;
+++	case FLOW_CLS_STATS:
+++		ret = ppe_flow_stats(flow, cls);
+++		break;
+++	default:
+++		ret = -EOPNOTSUPP;
+++		break;
+++	}
+++
+++out:
+++	mutex_unlock(&flow->lock);
+++
+++	return ret;
+++}
+++
+++static int ppe_flow_block_cb(enum tc_setup_type type, void *type_data,
+++			     void *cb_priv)
+++{
+++	struct net_device *dev = cb_priv;
+++
+++	if (type != TC_SETUP_CLSFLOWER || !tc_can_offload(dev) ||
+++	    !ppe_flow_ctx)
+++		return -EOPNOTSUPP;
+++
+++	return ppe_flow_cmd(ppe_flow_ctx, type_data);
+++}
+++
+++static LIST_HEAD(ppe_flow_block_cb_list);
+++
+++static int ppe_flow_setup_block(struct net_device *dev,
+++				struct flow_block_offload *f)
+++{
+++	struct flow_block_cb *block_cb;
+++	struct ppe_flow *flow = ppe_flow_ctx;
+++
+++	if (!flow)
+++		return -EOPNOTSUPP;
+++
+++	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+++		return -EOPNOTSUPP;
+++
+++	f->driver_block_list = &ppe_flow_block_cb_list;
+++
+++	switch (f->command) {
+++	case FLOW_BLOCK_BIND:
+++		block_cb = flow_block_cb_lookup(f->block, ppe_flow_block_cb, dev);
+++		if (block_cb) {
+++			flow_block_cb_incref(block_cb);
+++			return 0;
+++		}
+++
+++		block_cb = flow_block_cb_alloc(ppe_flow_block_cb, dev, dev, NULL);
+++		if (IS_ERR(block_cb))
+++			return PTR_ERR(block_cb);
+++
+++		flow_block_cb_incref(block_cb);
+++		flow_block_cb_add(block_cb, f);
+++		list_add_tail(&block_cb->driver_list, &ppe_flow_block_cb_list);
+++		return 0;
+++	case FLOW_BLOCK_UNBIND:
+++		block_cb = flow_block_cb_lookup(f->block, ppe_flow_block_cb, dev);
+++		if (!block_cb)
+++			return -ENOENT;
+++
+++		if (!flow_block_cb_decref(block_cb)) {
+++			flow_block_cb_remove(block_cb, f);
+++			list_del(&block_cb->driver_list);
+++		}
+++
+++		/* The flowtable removes its flows before unbinding; drop
+++		 * whatever is left once the last block is gone.
+++		 */
+++		if (list_empty(&ppe_flow_block_cb_list)) {
+++			mutex_lock(&flow->lock);
+++			ppe_flow_flush(flow);
+++			mutex_unlock(&flow->lock);
+++		}
+++		return 0;
+++	default:
+++		return -EOPNOTSUPP;
+++	}
+++}
+++
+++/**
+++ * ppe_flow_setup_tc - Offload netfilter flowtable flows to the PPE
+++ * @dev: EDMA port net device, or the conduit a DSA user port forwards to
+++ * @type: TC setup type
+++ * @type_data: Flow block offload
+++ *
+++ * Return: 0 on success, negative error code on failure.
+++ */
+++int ppe_flow_setup_tc(struct net_device *dev, enum tc_setup_type type,
+++		      void *type_data)
+++{
+++	switch (type) {
+++	case TC_SETUP_FT:
+++		return ppe_flow_setup_block(dev, type_data);
+++	default:
+++		return -EOPNOTSUPP;
+++	}
+++}
+++
+++static int ppe_flow_debugfs_show(struct seq_file *seq, void *v)
+++{
+++	static const char * const fwd_names[] = {
+++		[PPE_FLOW_FWD_SNAT] = "snat",
+++		[PPE_FLOW_FWD_DNAT] = "dnat",
+++		[PPE_FLOW_FWD_ROUTE] = "route",
+++	};
+++	struct ppe_flow *flow = seq->private;
+++	struct ppe_flow_nexthop *nh;
+++	struct ppe_flow_entry *entry;
+++	struct ppe_flow_host *host;
+++	u32 val, buf[PPE_FLOW_ENTRY_WORDS];
+++	int i;
+++
+++	mutex_lock(&flow->lock);
+++
+++	regmap_read(flow->ppe_dev->regmap, PPE_FLOW_CTRL0_ADDR, &val);
+++	seq_printf(seq, "FLOW_CTRL0 0x%08x ", val);
+++	regmap_read(flow->ppe_dev->regmap, PPE_FLOW_CTRL1_ADDR, &val);
+++	seq_printf(seq, "FLOW_CTRL1 0x%08x ", val);
+++	regmap_read(flow->ppe_dev->regmap, PPE_L3_ROUTE_CTRL_ADDR, &val);
+++	seq_printf(seq, "L3_ROUTE_CTRL 0x%08x ", val);
+++	regmap_read(flow->ppe_dev->regmap, PPE_L3_ROUTE_CTRL_EXT_ADDR, &val);
+++	seq_printf(seq, "L3_ROUTE_CTRL_EXT 0x%08x\n", val);
+++
+++	seq_printf(seq, "flows %u, ingress ports 0x%lx\n", flow->num_entries,
+++		   flow->in_ports);
+++
+++	for (i = 0; i < PPE_MY_MAC_TBL_ENTRIES; i++)
+++		if (flow->macs[i].refcnt)
+++			seq_printf(seq, "mac %d %pM refs %u\n", i,
+++				   flow->macs[i].addr, flow->macs[i].refcnt);
+++
+++	for (i = 0; i < PPE_IN_PUB_IP_ADDR_TBL_ENTRIES; i++)
+++		if (flow->pub_ips[i].refcnt)
+++			seq_printf(seq, "pub_ip %d %pI4 refs %u\n", i,
+++				   &flow->pub_ips[i].addr,
+++				   flow->pub_ips[i].refcnt);
+++
+++	list_for_each_entry(host, &flow->hosts, list)
+++		seq_printf(seq, "host %u %pI4 refs %u\n", host->index,
+++			   &host->addr, host->refcnt);
+++
+++	list_for_each_entry(nh, &flow->nexthops, list)
+++		seq_printf(seq, "nexthop %u port %d vid %s%u dmac %pM smac %d pub_ip %d dnat %pI4 refs %u\n",
+++			   nh->index, nh->port, nh->tagged ? "" : "-",
+++			   nh->cvid, nh->dmac, nh->mac_slot, nh->pub_ip,
+++			   &nh->dnat_addr, nh->refcnt);
+++
+++	list_for_each_entry(entry, &flow->entry_list, list) {
+++		u64 packets = 0, bytes = 0;
+++
+++		ppe_flow_tbl_read(flow, PPE_IN_FLOW_TBL_ADDR +
+++				  PPE_IN_FLOW_TBL_INC * entry->index,
+++				  buf, ARRAY_SIZE(buf));
+++		/* Leave the counters to the flowtable statistics. */
+++		ppe_flow_counters(flow, entry, &packets, &bytes, false);
+++		packets += entry->packets;
+++		bytes += entry->bytes;
+++
+++		seq_printf(seq, "flow %u %s %s %pI4:%u -> %pI4:%u new %pI4:%u in_port %d nexthop %u host %u valid %u packets %llu bytes %llu\n",
+++			   entry->index, fwd_names[entry->fwd_type],
+++			   entry->l4proto == IPPROTO_TCP ? "tcp" : "udp",
+++			   &entry->saddr, be16_to_cpu(entry->sport),
+++			   &entry->daddr, be16_to_cpu(entry->dport),
+++			   &entry->new_addr, be16_to_cpu(entry->new_port),
+++			   entry->in_port, entry->nh->index,
+++			   entry->host->index,
+++			   ppe_flow_field_get(buf, PPE_IN_FLOW_W_VALID),
+++			   packets, bytes);
+++	}
+++
+++	mutex_unlock(&flow->lock);
+++
+++	return 0;
+++}
+++DEFINE_SHOW_ATTRIBUTE(ppe_flow_debugfs);
+++
+++/**
+++ * ppe_flow_init - Prepare flowtable offload
+++ * @ppe_dev: PPE device
+++ *
+++ * Nothing is written to the PPE until the first flow is offloaded.
+++ *
+++ * Return: 0 on success, negative error code on failure.
+++ */
+++int ppe_flow_init(struct ppe_device *ppe_dev)
+++{
+++	struct ppe_flow *flow;
+++	int ret;
+++
+++	flow = devm_kzalloc(ppe_dev->dev, sizeof(*flow), GFP_KERNEL);
+++	if (!flow)
+++		return -ENOMEM;
+++
+++	flow->ppe_dev = ppe_dev;
+++	flow->nh_num = ppe_is_ipq5332(ppe_dev) ? 768 : 2560;
+++	flow->nh_map = devm_bitmap_zalloc(ppe_dev->dev, flow->nh_num,
+++					  GFP_KERNEL);
+++	if (!flow->nh_map)
+++		return -ENOMEM;
+++
+++	mutex_init(&flow->lock);
+++	INIT_LIST_HEAD(&flow->entry_list);
+++	INIT_LIST_HEAD(&flow->hosts);
+++	INIT_LIST_HEAD(&flow->nexthops);
+++
+++	ret = rhashtable_init(&flow->entries, &ppe_flow_ht_params);
+++	if (ret)
+++		return ret;
+++
+++	if (ppe_dev->debugfs_root)
+++		flow->debugfs = debugfs_create_file("flow", 0444,
+++						    ppe_dev->debugfs_root, flow,
+++						    &ppe_flow_debugfs_fops);
+++
+++	ppe_flow_ctx = flow;
+++
+++	return 0;
+++}
+++
+++/**
+++ * ppe_flow_deinit - Remove all offloaded flows
+++ * @ppe_dev: PPE device
+++ */
+++void ppe_flow_deinit(struct ppe_device *ppe_dev)
+++{
+++	struct ppe_flow *flow = ppe_flow_ctx;
+++
+++	if (!flow || flow->ppe_dev != ppe_dev)
+++		return;
+++
+++	ppe_flow_ctx = NULL;
+++	debugfs_remove(flow->debugfs);
+++
+++	mutex_lock(&flow->lock);
+++	ppe_flow_flush(flow);
+++	mutex_unlock(&flow->lock);
+++
+++	rhashtable_destroy(&flow->entries);
+++}
++diff --git a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++new file mode 100644
++index 000000000..5a8d0f133
++--- /dev/null
+++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++@@ -0,0 +1,37 @@
+++/* SPDX-License-Identifier: GPL-2.0-only
+++ *
+++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+++ */
+++
+++/* PPE IPv4 flow offload for the netfilter flowtable. */
+++
+++#ifndef __PPE_FLOW_H__
+++#define __PPE_FLOW_H__
+++
+++#include <linux/netdevice.h>
+++#include <net/pkt_cls.h>
+++
+++struct ppe_device;
+++
+++#if IS_ENABLED(CONFIG_QCOM_PPE_FLOW_OFFLOAD)
+++int ppe_flow_init(struct ppe_device *ppe_dev);
+++void ppe_flow_deinit(struct ppe_device *ppe_dev);
+++int ppe_flow_setup_tc(struct net_device *dev, enum tc_setup_type type,
+++		      void *type_data);
+++#else
+++static inline int ppe_flow_init(struct ppe_device *ppe_dev)
+++{
+++	return 0;
+++}
+++
+++static inline void ppe_flow_deinit(struct ppe_device *ppe_dev)
+++{
+++}
+++
+++static inline int ppe_flow_setup_tc(struct net_device *dev,
+++				    enum tc_setup_type type, void *type_data)
+++{
+++	return -EOPNOTSUPP;
+++}
+++#endif
+++#endif
++diff --git a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++index 0711a3545..1df99fda6 100644
++--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++@@ -1113,4 +1113,180 @@
++ 
++ #define PPE_P1_MULTICAST_DROP_CNT_TBL_ADDR	\
++ 	(PPE_P0_MULTICAST_DROP_CNT_TBL_ADDR + PPE_MULTICAST_QUEUE_PORT_ADDR_INC)
+++/* L3 routing and flow offload. The table entries below span several 32-bit
+++ * words, so their fields are given as the first bit, counted from bit 0 of
+++ * the first word, and the width.
+++ */
+++#define PPE_TBL_FIELD(lsb, width)		(((width) << 16) | (lsb))
+++#define PPE_TBL_FIELD_LSB(field)		((field) & 0xffff)
+++#define PPE_TBL_FIELD_WIDTH(field)		((field) >> 16)
+++
+++#define PPE_MY_MAC_TBL_ADDR			0x200000
+++#define PPE_MY_MAC_TBL_ENTRIES			8
+++#define PPE_MY_MAC_TBL_INC			0x8
+++#define PPE_MY_MAC_W_MAC_LO			PPE_TBL_FIELD(0, 32)
+++#define PPE_MY_MAC_W_MAC_HI			PPE_TBL_FIELD(32, 16)
+++#define PPE_MY_MAC_W_VALID			PPE_TBL_FIELD(48, 1)
+++
+++#define PPE_L3_ROUTE_CTRL_ADDR			0x200480
+++#define PPE_L3_ROUTE_CTRL_MRU_FAIL_CMD		GENMASK(1, 0)
+++#define PPE_L3_ROUTE_CTRL_MRU_FAIL_DE_ACCE	BIT(2)
+++#define PPE_L3_ROUTE_CTRL_MTU_FAIL_CMD		GENMASK(4, 3)
+++#define PPE_L3_ROUTE_CTRL_MTU_FAIL_DE_ACCE	BIT(5)
+++#define PPE_L3_ROUTE_CTRL_MTU_DF_FAIL_CMD	GENMASK(7, 6)
+++#define PPE_L3_ROUTE_CTRL_MTU_DF_FAIL_DE_ACCE	BIT(8)
+++
+++#define PPE_L3_ROUTE_CTRL_EXT_ADDR		0x200494
+++#define PPE_L3_ROUTE_CTRL_EXT_ROUTE_MISMATCH	GENMASK(1, 0)
+++#define PPE_L3_ROUTE_CTRL_EXT_PMTU_FAIL_CMD	GENMASK(9, 8)
+++#define PPE_L3_ROUTE_CTRL_EXT_PMTU_FAIL_DE_ACCE	BIT(10)
+++#define PPE_L3_ROUTE_CTRL_EXT_PMTU_DF_FAIL_CMD	GENMASK(12, 11)
+++#define PPE_L3_ROUTE_CTRL_EXT_PMTU_DF_DE_ACCE	BIT(13)
+++
+++#define PPE_FLOW_CTRL0_ADDR			0x2004a8
+++#define PPE_FLOW_CTRL0_FLOW_EN			BIT(0)
+++
+++/* One FLOW_CTRL1 register for each packet type (L3 unicast, L2 unicast,
+++ * multicast), holding the same six bits for each of the five flow
+++ * directions.
+++ */
+++#define PPE_FLOW_CTRL1_ADDR			0x2004bc
+++#define PPE_FLOW_CTRL1_INC			4
+++#define PPE_FLOW_CTRL1_L3_UNICAST		0
+++#define PPE_FLOW_CTRL1_DIRS			5
+++#define PPE_FLOW_CTRL1_DIR_SHIFT(dir)		((dir) * 6)
+++#define PPE_FLOW_CTRL1_MISS_CMD			GENMASK(1, 0)
+++#define PPE_FLOW_CTRL1_FRAG_BYPASS		BIT(2)
+++#define PPE_FLOW_CTRL1_TCP_SPECIAL		BIT(3)
+++#define PPE_FLOW_CTRL1_BYPASS			BIT(4)
+++#define PPE_FLOW_CTRL1_KEY_SEL			BIT(5)
+++#define PPE_FLOW_CTRL1_DIR_MASK			GENMASK(5, 0)
+++
+++/* TCP flag patterns that raise the TCP_FLAGS_<n> L3 exceptions. */
+++#define PPE_L4_EXCEP_PARSER_CTRL_ADDR		0x1e0028
+++#define PPE_L4_EXCEP_PARSER_CTRL_INC		4
+++#define PPE_L4_EXCEP_PARSER_FLAGS(n)		(GENMASK(5, 0) << ((n) % 2 * 16))
+++#define PPE_L4_EXCEP_PARSER_MASK(n)		(GENMASK(13, 8) << ((n) % 2 * 16))
+++
+++/* L3 exceptions, indexed by exception code (CPU code - 1). */
+++#define PPE_L3_EXCEP_CMD_ADDR			0x20081c
+++#define PPE_L3_EXCEP_CMD_INC			4
+++#define PPE_L3_EXCEP_CMD_CMD			GENMASK(1, 0)
+++#define PPE_L3_EXCEP_CMD_DE_ACCE		BIT(2)
+++#define PPE_L3_FLOW_HIT_EXCEP_CTRL_ADDR		0x201678
+++#define PPE_L3_FLOW_HIT_EXCEP_CTRL_INC		4
+++#define PPE_L3_FLOW_HIT_EXCEP_CTRL_EN		BIT(0)
+++#define PPE_L3_EXCEP_TCP_FLAGS(n)		(46 + (n))
+++
+++#define PPE_IN_PUB_IP_ADDR_TBL_ADDR		0x2004d8
+++#define PPE_IN_PUB_IP_ADDR_TBL_ENTRIES		16
+++#define PPE_IN_PUB_IP_ADDR_TBL_INC		4
+++
+++/* The flow and host tables are hashed: entries are added and removed
+++ * through an operation register, the entry data registers and a result
+++ * register that returns the index the hardware chose.
+++ */
+++#define PPE_IN_FLOW_TBL_OP_ADDR			0x200528
+++#define PPE_IN_FLOW_TBL_OP_DATA_ADDR		0x200550
+++#define PPE_IN_FLOW_TBL_OP_RSLT_ADDR		0x2005c4
+++#define PPE_IN_FLOW_TBL_OP_CMD_ID		GENMASK(3, 0)
+++#define PPE_IN_FLOW_TBL_OP_TYPE			GENMASK(7, 5)
+++#define PPE_IN_FLOW_TBL_OP_HASH_BLOCK		GENMASK(9, 8)
+++#define PPE_IN_FLOW_TBL_OP_MODE			BIT(10)
+++#define PPE_IN_FLOW_TBL_OP_INDEX		GENMASK(23, 12)
+++#define PPE_IN_FLOW_TBL_RSLT_CMD_ID		GENMASK(3, 0)
+++#define PPE_IN_FLOW_TBL_RSLT_FAIL		BIT(4)
+++#define PPE_IN_FLOW_TBL_RSLT_INDEX		GENMASK(16, 5)
+++#define PPE_IN_FLOW_TBL_RSLT_VALID_CNT		GENMASK(20, 17)
+++
+++#define PPE_HOST_TBL_OP_ADDR			0x200724
+++#define PPE_HOST_TBL_OP_DATA_ADDR		0x200738
+++#define PPE_HOST_TBL_OP_RSLT_ADDR		0x200770
+++#define PPE_HOST_TBL_OP_CMD_ID			GENMASK(3, 0)
+++#define PPE_HOST_TBL_OP_TYPE			GENMASK(7, 5)
+++#define PPE_HOST_TBL_OP_HASH_BLOCK		GENMASK(9, 8)
+++#define PPE_HOST_TBL_OP_MODE			BIT(10)
+++#define PPE_HOST_TBL_OP_INDEX			GENMASK(23, 11)
+++#define PPE_HOST_TBL_RSLT_CMD_ID		GENMASK(3, 0)
+++#define PPE_HOST_TBL_RSLT_FAIL			BIT(4)
+++#define PPE_HOST_TBL_RSLT_INDEX			GENMASK(17, 5)
+++#define PPE_HOST_TBL_RSLT_VALID_CNT		GENMASK(21, 18)
+++
+++#define PPE_TBL_OP_ADD				0
+++#define PPE_TBL_OP_DEL				1
+++#define PPE_TBL_OP_MODE_HASH			0
+++#define PPE_TBL_OP_MODE_INDEX			1
+++
+++/* Port to ingress L3 interface. */
+++#define PPE_L3_VP_PORT_TBL_ADDR			0x204000
+++#define PPE_L3_VP_PORT_TBL_INC			0x10
+++#define PPE_L3_VP_PORT_W_L3_IF_VALID		PPE_TBL_FIELD(0, 1)
+++#define PPE_L3_VP_PORT_W_L3_IF_INDEX		PPE_TBL_FIELD(1, 8)
+++
+++#define PPE_L3_IF_TBL_ENTRIES			256
+++
+++#define PPE_IN_L3_IF_TBL_ADDR			0x206000
+++#define PPE_IN_L3_IF_TBL_INC			0x10
+++#define PPE_IN_L3_IF_W_MRU			PPE_TBL_FIELD(0, 14)
+++#define PPE_IN_L3_IF_W_MTU			PPE_TBL_FIELD(14, 14)
+++#define PPE_IN_L3_IF_W_IPV4_UC_ROUTE_EN		PPE_TBL_FIELD(29, 1)
+++#define PPE_IN_L3_IF_W_TTL_EXCEED_CMD		PPE_TBL_FIELD(32, 2)
+++#define PPE_IN_L3_IF_W_TTL_EXCEED_DE_ACCE	PPE_TBL_FIELD(34, 1)
+++#define PPE_IN_L3_IF_W_MAC_BITMAP		PPE_TBL_FIELD(35, 8)
+++#define PPE_IN_L3_IF_W_DMAC_CHECK_DIS		PPE_TBL_FIELD(44, 1)
+++#define PPE_IN_L3_IF_W_MRU_IPV6			PPE_TBL_FIELD(50, 14)
+++#define PPE_IN_L3_IF_W_MTU_IPV6			PPE_TBL_FIELD(64, 14)
+++
+++#define PPE_EG_L3_IF_TBL_ADDR			0x23000
+++#define PPE_EG_L3_IF_TBL_INC			0x10
+++#define PPE_EG_L3_IF_W_MAC_LO			PPE_TBL_FIELD(0, 32)
+++#define PPE_EG_L3_IF_W_MAC_HI			PPE_TBL_FIELD(32, 16)
+++
+++#define PPE_HOST_TBL_ADDR			0x220000
+++#define PPE_HOST_TBL_INC			0x10
+++#define PPE_HOST_W_VALID			PPE_TBL_FIELD(0, 1)
+++#define PPE_HOST_W_KEY_TYPE			PPE_TBL_FIELD(1, 2)
+++#define PPE_HOST_W_FWD_CMD			PPE_TBL_FIELD(3, 2)
+++#define PPE_HOST_W_IP_ADDR			PPE_TBL_FIELD(32, 32)
+++
+++#define PPE_IN_FLOW_TBL_ADDR			0x240000
+++#define PPE_IN_FLOW_TBL_INC			0x20
+++#define PPE_IN_FLOW_W_VALID			PPE_TBL_FIELD(0, 1)
+++#define PPE_IN_FLOW_W_ENTRY_TYPE		PPE_TBL_FIELD(1, 1)
+++#define PPE_IN_FLOW_W_HOST_INDEX_TYPE		PPE_TBL_FIELD(2, 1)
+++#define PPE_IN_FLOW_W_HOST_INDEX		PPE_TBL_FIELD(3, 13)
+++#define PPE_IN_FLOW_W_PROTOCOL			PPE_TBL_FIELD(16, 2)
+++#define PPE_IN_FLOW_W_FWD_TYPE			PPE_TBL_FIELD(29, 3)
+++#define PPE_IN_FLOW_W_NEXTHOP			PPE_TBL_FIELD(32, 12)
+++#define PPE_IN_FLOW_W_NAT_L4_PORT		PPE_TBL_FIELD(44, 16)
+++#define PPE_IN_FLOW_W_SERVICE_CODE		PPE_TBL_FIELD(68, 8)
+++#define PPE_IN_FLOW_W_IP_ADDR			PPE_TBL_FIELD(76, 32)
+++#define PPE_IN_FLOW_W_L4_SPORT			PPE_TBL_FIELD(108, 16)
+++#define PPE_IN_FLOW_W_L4_DPORT			PPE_TBL_FIELD(124, 16)
+++#define PPE_IN_FLOW_W_PMTU_CHECK_L3		PPE_TBL_FIELD(148, 1)
+++#define PPE_IN_FLOW_W_PMTU			PPE_TBL_FIELD(149, 14)
+++
+++#define PPE_FLOW_FWD_SNAT			1
+++#define PPE_FLOW_FWD_DNAT			2
+++#define PPE_FLOW_FWD_ROUTE			3
+++#define PPE_FLOW_PROTO_TCP			1
+++#define PPE_FLOW_PROTO_UDP			2
+++
+++#define PPE_IN_NEXTHOP_TBL_ADDR			0x260000
+++#define PPE_IN_NEXTHOP_TBL_INC			0x20
+++#define PPE_IN_NEXTHOP_W_TYPE_PORT		PPE_TBL_FIELD(0, 1)
+++#define PPE_IN_NEXTHOP_W_PORT			PPE_TBL_FIELD(1, 8)
+++#define PPE_IN_NEXTHOP_W_POST_L3_IF		PPE_TBL_FIELD(9, 8)
+++#define PPE_IN_NEXTHOP_W_CTAG_FMT		PPE_TBL_FIELD(31, 1)
+++#define PPE_IN_NEXTHOP_W_CVID			PPE_TBL_FIELD(32, 12)
+++#define PPE_IN_NEXTHOP_W_PUB_IP_INDEX		PPE_TBL_FIELD(44, 4)
+++#define PPE_IN_NEXTHOP_W_MAC_LO			PPE_TBL_FIELD(48, 16)
+++#define PPE_IN_NEXTHOP_W_MAC_HI			PPE_TBL_FIELD(64, 32)
+++#define PPE_IN_NEXTHOP_W_DNAT_IP		PPE_TBL_FIELD(96, 32)
+++
+++#define PPE_IN_FLOW_CNT_TBL_ADDR		0x120000
+++#define PPE_IN_FLOW_CNT_TBL_INC			0x10
+++#define PPE_IN_FLOW_CNT_W_PKTS			PPE_TBL_FIELD(0, 32)
+++#define PPE_IN_FLOW_CNT_W_BYTES_LO		PPE_TBL_FIELD(32, 32)
+++#define PPE_IN_FLOW_CNT_W_BYTES_HI		PPE_TBL_FIELD(64, 8)
++ #endif
+-- 
+2.43.0
+
