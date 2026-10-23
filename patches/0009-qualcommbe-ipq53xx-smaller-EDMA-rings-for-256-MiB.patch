@@ -1,0 +1,70 @@
+From 1c2cde2692cdb3d17ddea0cb72178affde471a74 Mon Sep 17 00:00:00 2001
+From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
+Date: Fri, 23 Oct 2026 07:47:05 +0000
+Subject: [PATCH] qualcommbe: ipq53xx: smaller EDMA rings for 256 MiB
+
+Add patch 9116: 512 instead of 2048 entries per EDMA Rx fill ring and
+Tx ring, which frees about 15 MiB of posted Rx buffers and caps the
+sent buffers waiting for Tx completion. With 2048 the hostapd process
+was killed by the OOM killer during a full-speed Wi-Fi upload test.
+---
+ ...rnet-qualcomm-ppe-smaller-EDMA-rings.patch | 47 +++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+ create mode 100644 target/linux/qualcommbe/patches-6.18/9116-net-ethernet-qualcomm-ppe-smaller-EDMA-rings.patch
+
+diff --git a/target/linux/qualcommbe/patches-6.18/9116-net-ethernet-qualcomm-ppe-smaller-EDMA-rings.patch b/target/linux/qualcommbe/patches-6.18/9116-net-ethernet-qualcomm-ppe-smaller-EDMA-rings.patch
+new file mode 100644
+index 0000000..70dd222
+--- /dev/null
++++ b/target/linux/qualcommbe/patches-6.18/9116-net-ethernet-qualcomm-ppe-smaller-EDMA-rings.patch
+@@ -0,0 +1,47 @@
++From 7a4510138641790166a4ae3f11b305aa4d3ca74b Mon Sep 17 00:00:00 2001
++From: OpenWrt-Xiaomi-RD16-port <rd16@localhost>
++Date: Fri, 23 Oct 2026 07:46:55 +0000
++Subject: [PATCH] net: ethernet: qualcomm: ppe: smaller EDMA rings for 256 MiB
++ boards
++
++Each of the four Rx fill rings keeps 2048 buffers of about 2.4 KiB
++posted, about 20 MiB in all, and each port has one 2048-entry Tx ring
++per CPU, which can hold up to 8192 sent buffers until their completions
++are reaped. On a 256 MiB IPQ5332 board, where Linux manages about
++170 MiB and ath12k takes most of it, that leaves too little for
++bursts: a Wi-Fi upload at full speed ends in the OOM killer.
++
++Use 512 entries for both: still several milliseconds at line rate per
++ring, and well above the Rx flow control thresholds (32/64) and the
++interrupt mitigation counts (16).
++---
++ drivers/net/ethernet/qualcomm/ppe/edma_rx.h | 2 +-
++ drivers/net/ethernet/qualcomm/ppe/edma_tx.h | 2 +-
++ 2 files changed, 2 insertions(+), 2 deletions(-)
++
++diff --git a/drivers/net/ethernet/qualcomm/ppe/edma_rx.h b/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
++index 181a06421..fd6838697 100644
++--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
+++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
++@@ -28,7 +28,7 @@
++ #define EDMA_RXDESC_SEC_DESC(R, i)	EDMA_GET_SDESC(R, i, \
++ 						struct edma_rxdesc_sec)
++ 
++-#define EDMA_RX_RING_SIZE	2048
+++#define EDMA_RX_RING_SIZE	512
++ 
++ #define EDMA_RX_RING_SIZE_MASK	(EDMA_RX_RING_SIZE - 1)
++ #define EDMA_RX_RING_ID_MASK		0x1F
++diff --git a/drivers/net/ethernet/qualcomm/ppe/edma_tx.h b/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
++index 5cf56ddec..3cb22f0c2 100644
++--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
+++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
++@@ -22,7 +22,7 @@
++ 			((((head) - (tail)) + \
++ 			(max)) & ((max) - 1)); })
++ 
++-#define EDMA_TX_RING_SIZE               2048
+++#define EDMA_TX_RING_SIZE               512
++ #define EDMA_TX_RING_SIZE_MASK		(EDMA_TX_RING_SIZE - 1)
++ 
++ /* Max segment processing capacity of HW for TSO. */
+-- 
+2.43.0
+
